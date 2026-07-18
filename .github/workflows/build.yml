@@ -1,0 +1,70 @@
+name: Build i Release
+
+# Buduje lekki launcher Czysciciel (folder z Czysciciel.exe) na Windowsie GitHuba
+# i publikuje go jako ZIP w Release. Ciezkie skladniki (torch, model, ffmpeg)
+# dociagane sa u uzytkownika przy pierwszym uruchomieniu (Architektura 1),
+# wiec artefakt CI jest maly (~120 MB).
+
+on:
+  push:
+    tags:
+      - "v*"            # publikacja releasu po wypchnieciu tagu v1.0.0 itd.
+  workflow_dispatch:    # mozliwosc recznego uruchomienia z zakladki Actions
+
+permissions:
+  contents: write        # potrzebne do utworzenia Release i wgrania assetu
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Pobierz kod
+        uses: actions/checkout@v4
+
+      - name: Ustaw Pythona 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Zainstaluj zaleznosci buildu
+        run: |
+          python -m pip install --upgrade pip
+          pip install wxpython pyinstaller
+
+      - name: Zbuduj launcher (PyInstaller onedir)
+        run: |
+          pyinstaller --name Czysciciel --windowed --noconfirm --clean `
+            --add-data "bootstrap.py;." `
+            --add-data "worker.py;." `
+            --add-data "gui.py;." `
+            --collect-submodules wx `
+            czysciciel.py
+
+      - name: Dolacz dokumenty do paczki
+        run: |
+          copy README.md dist\Czysciciel\
+          copy LICENSE dist\Czysciciel\
+          copy TRZECIE_STRONY.txt dist\Czysciciel\
+
+      - name: Spakuj folder do ZIP
+        run: |
+          Compress-Archive -Path dist\Czysciciel\* -DestinationPath Czysciciel-windows.zip -Force
+
+      - name: Wgraj artefakt buildu (dla uruchomien recznych)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Czysciciel-windows
+          path: Czysciciel-windows.zip
+
+      - name: Opublikuj Release (tylko dla tagow)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Czysciciel-windows.zip
+          generate_release_notes: true
+          body: |
+            Czysciciel - aplikacja Windows do czyszczenia audio z fillerow i pauz.
+
+            Pobierz **Czysciciel-windows.zip**, rozpakuj i uruchom `Czysciciel.exe`.
+            Przy pierwszym uruchomieniu program dociaga jednorazowo srodowisko
+            (silnik AI + model + ffmpeg); potem dziala offline.

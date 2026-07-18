@@ -1,0 +1,26 @@
+# Buildy i artefakty
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+
+# Logi robocze
+build.log
+bootstrap_test.log
+
+# Pliki audio i wyniki (nie dystrybuujemy nagrań)
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.ogg
+*.opus
+*.aac
+*.wma
+*.RPP
+ciecia_*.json
+
+# Srodowiska
+.venv/
+venv/

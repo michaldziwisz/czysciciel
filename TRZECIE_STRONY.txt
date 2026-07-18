@@ -1,0 +1,54 @@
+Czysciciel korzysta z następujących komponentów firm trzecich. Poniżej
+wymieniono ich licencje i źródła. Sam kod Czyściciela jest na licencji MIT
+(plik LICENSE).
+
+Komponenty pobierane przy pierwszym uruchomieniu do
+%LOCALAPPDATA%\Czysciciel (nie są zawarte w tym repozytorium):
+
+1. Model klasyfikacji fillerów
+   classla/wav2vecbert2-filledPause
+   Licencja: Apache License 2.0
+   Źródło: https://huggingface.co/classla/wav2vecbert2-filledPause
+
+2. PyTorch (torch)
+   Licencja: BSD-3-Clause
+   Źródło: https://pytorch.org
+
+3. Hugging Face Transformers
+   Licencja: Apache License 2.0
+   Źródło: https://github.com/huggingface/transformers
+
+4. librosa
+   Licencja: ISC
+   Źródło: https://librosa.org
+
+5. soundfile (libsndfile)
+   Licencja: BSD-3-Clause / LGPL-2.1 (libsndfile)
+   Źródło: https://github.com/bastibe/python-soundfile
+
+6. pandas, numpy
+   Licencja: BSD-3-Clause
+   Źródło: https://pandas.pydata.org , https://numpy.org
+
+7. ffmpeg (build statyczny, wariant LGPL - BtbN/FFmpeg-Builds)
+   Licencja: LGPL 2.1+
+   Źródło: https://github.com/BtbN/FFmpeg-Builds
+   Uwaga: świadomie użyto wariantu LGPL (nie GPL), aby umożliwić
+   swobodną dystrybucję.
+
+8. uv (instalator środowiska, Astral)
+   Licencja: Apache-2.0 / MIT
+   Źródło: https://github.com/astral-sh/uv
+
+Komponenty użyte do zbudowania launchera:
+
+9. wxPython
+   Licencja: wxWindows Library Licence (liberalna, oparta na LGPL)
+   Źródło: https://wxpython.org
+
+10. PyInstaller
+    Licencja: GPL-2.0 z wyjątkiem pozwalającym na dystrybucję
+    zbudowanych aplikacji pod dowolną licencją.
+    Źródło: https://pyinstaller.org
+
+Pełne teksty licencji dostępne są pod podanymi adresami źródłowymi.
