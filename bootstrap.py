@@ -126,6 +126,50 @@ def _run(cmd, desc, env=None):
         raise RuntimeError(f"{desc} nie powiodlo sie (kod {r.returncode}):\n{tail}")
     return r
 
+UPDATE_EVERY_DAYS = 7  # jak czesto sprawdzac aktualizacje modelu
+
+def maybe_update_model(P, env):
+    """Sprawdza aktualizacje modelu NAJWYZEJ raz na UPDATE_EVERY_DAYS dni.
+    snapshot_download sciaga TYLKO zmienione/nowe pliki (ETag) - gdy nic sie nie
+    zmienilo, nie pobiera nic. Brak sieci = cicha rezygnacja (dzialamy z cache).
+    Znacznik ostatniej proby w pliku last_update_check."""
+    chk = os.path.join(P["runtime"], "last_update_check")
+    try:
+        last = float(open(chk).read().strip()) if os.path.exists(chk) else 0
+    except Exception:
+        last = 0
+    if time.time() - last < UPDATE_EVERY_DAYS*86400:
+        return  # za wczesnie - nie zawracamy glowy siecia
+    blog("sprawdzam aktualizacje modelu (raz na tydzien)...")
+    dl = os.path.join(P["runtime"], "_upd.py")
+    with open(dl, "w", encoding="utf-8") as f:
+        f.write(
+            "import os, sys\n"
+            f"os.environ['HF_HOME']=r'{P['hf']}'\n"
+            "try:\n"
+            "    from huggingface_hub import snapshot_download\n"
+            f"    snapshot_download('{MODEL}', etag_timeout=10)\n"
+            "    print('UPD_OK')\n"
+            "except Exception as e:\n"
+            "    print('UPD_SKIP', repr(e)[:120]); sys.exit(0)\n"
+        )
+    try:
+        r = subprocess.run([P["vpy"], dl], capture_output=True, text=True, env=env, timeout=180)
+        if "UPD_OK" in (r.stdout or ""):
+            blog("model aktualny (lub pobrano nowsza wersje)")
+        else:
+            blog("brak sieci/aktualizacji - dzialam z lokalnego modelu")
+    except Exception:
+        blog("sprawdzenie aktualizacji pominiete - dzialam z lokalnego modelu")
+    finally:
+        try: os.remove(dl)
+        except Exception: pass
+    # zapisz znacznik NIEZALEZNIE od wyniku (nie ponawiaj codziennie przy braku sieci)
+    try:
+        open(chk, "w").write(str(int(time.time())))
+    except Exception:
+        pass
+
 def ensure(force_device=None):
     """Glowna funkcja. force_device: None(auto)/'cuda'/'cpu'. Zwraca (vpy, ffmpeg)."""
     P = _paths()
@@ -140,6 +184,10 @@ def ensure(force_device=None):
             if meta.get("ver") == RUNTIME_VER and os.path.exists(P["vpy"]) and os.path.exists(P["ffmpeg"]):
                 boot(100, "Srodowisko gotowe")
                 blog(f"srodowisko juz zainstalowane ({meta.get('device')})")
+                # okresowe, nieblokujace sprawdzenie aktualizacji modelu
+                env = os.environ.copy()
+                env["VIRTUAL_ENV"] = P["venv"]
+                maybe_update_model(P, env)
                 return P["vpy"], P["ffmpeg"]
         except Exception:
             pass
