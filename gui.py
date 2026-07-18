@@ -50,6 +50,11 @@ EKSPORTY = [
     ("oba",    "Audio i projekt Reapera"),
 ]
 BITRATE_LISTA = [64, 96, 128, 160, 192, 224, 256, 320]
+WARIANTY_RPP = [
+    ("gotowy",      "Gotowy: fragmenty już wycięte i dosunięte"),
+    ("przejrzenie", "Do przejrzenia: fragmenty oznaczone „WYTNIJ” (ripple)"),
+    ("oba",         "Oba projekty naraz"),
+]
 
 def app_dir():
     """Katalog, w ktorym lezy exe/skrypt (tam sa bootstrap.py, worker.py)."""
@@ -204,6 +209,14 @@ class MainFrame(wx.Frame):
         self.rb_eksport.SetName("Co zapisać")
         root.Add(self.rb_eksport, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
+        # wariant projektu Reapera (widoczny gdy eksport obejmuje reaper)
+        self.rb_wariant = wx.RadioBox(panel, label="Wariant projektu Reapera",
+                                      choices=[w[1] for w in WARIANTY_RPP],
+                                      majorDimension=1, style=wx.RA_SPECIFY_COLS)
+        self.rb_wariant.SetSelection(0)  # gotowy
+        self.rb_wariant.SetName("Wariant projektu Reapera")
+        root.Add(self.rb_wariant, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
         # opcja dodatkowa: osobny plik z wycietymi fragmentami (do odsluchu)
         self.cb_wyciete = wx.CheckBox(panel,
             label="Zapisz też osobny plik z tym, co &wycięte (do odsłuchu)")
@@ -355,15 +368,19 @@ class MainFrame(wx.Frame):
         self.lbl_bitrate.Enable(stratny)
 
     def on_eksport_change(self, evt):
-        """Gdy wybrany TYLKO projekt Reapera - ustawienia audio sa nieistotne, ukryj je."""
+        """Ustawienia audio widoczne gdy powstaje audio; wariant RPP - gdy powstaje reaper."""
         eksport = EKSPORTY[self.rb_eksport.GetSelection()][0]
         audio_potrzebne = eksport in ("audio", "oba")
+        reaper_potrzebny = eksport in ("reaper", "oba")
         self.box_fmt.GetStaticBox().Show(audio_potrzebne)
         for c in (self.ch_format, self.ch_kanaly, self.ch_bitrate, self.lbl_bitrate):
             c.Show(audio_potrzebne)
         # plik z wycietymi ma sens tylko gdy powstaje audio
         self.cb_wyciete.Show(audio_potrzebne)
         self.cb_wyciete.Enable(audio_potrzebne)
+        # wariant projektu Reapera - tylko gdy powstaje reaper
+        self.rb_wariant.Show(reaper_potrzebny)
+        self.rb_wariant.Enable(reaper_potrzebny)
         if audio_potrzebne:
             self.on_format_change(None)
         self.Layout()
@@ -382,7 +399,7 @@ class MainFrame(wx.Frame):
         for b in (self.btn_start, self.btn_add, self.btn_addfolder, self.btn_del,
                   self.btn_clear, self.btn_out, self.ch_preset, self.sc_minfiller,
                   self.rb_tryb, self.rb_eksport, self.ch_format, self.ch_kanaly,
-                  self.ch_bitrate, self.cb_wyciete):
+                  self.ch_bitrate, self.cb_wyciete, self.rb_wariant):
             b.Enable(not running)
         if not running:
             self.on_format_change(None)   # przywroc poprawny stan bitrate
@@ -405,10 +422,11 @@ class MainFrame(wx.Frame):
         bitrate = BITRATE_LISTA[self.ch_bitrate.GetSelection()]
         kanaly = ["zrodlo", "mono", "stereo"][self.ch_kanaly.GetSelection()]
         zapisz_wyciete = self.cb_wyciete.GetValue() and eksport in ("audio", "oba")
+        wariant_rpp = WARIANTY_RPP[self.rb_wariant.GetSelection()][0]
         outdir = self.txt_out.GetValue().strip() or None
         opts = dict(preset=preset, minf=minf, tryb=tryb, eksport=eksport,
                     fmt=fmt, bitrate=bitrate, kanaly=kanaly, outdir=outdir,
-                    zapisz_wyciete=zapisz_wyciete)
+                    zapisz_wyciete=zapisz_wyciete, wariant_rpp=wariant_rpp)
         self.stop_flag.clear()
         self._set_running(True)
         self.gauge.SetValue(0)
@@ -514,7 +532,8 @@ class MainFrame(wx.Frame):
                 "--format", opts["fmt"],
                 "--bitrate", f"{opts['bitrate']}",
                 "--kanaly", opts["kanaly"],
-                "--eksport", opts["eksport"]]
+                "--eksport", opts["eksport"],
+                "--wariant-rpp", opts.get("wariant_rpp", "gotowy")]
         if opts.get("zapisz_wyciete"):
             args.append("--zapisz-wyciete")
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

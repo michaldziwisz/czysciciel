@@ -191,44 +191,24 @@ def _rpp_guid():
     import uuid
     return "{" + str(uuid.uuid4()).upper() + "}"
 
-def export_rpp(rpp_path, source_file, keeps, merged, sr):
-    """
-    Projekt Reapera niedestrukcyjny: sciezka z itemami = ZACHOWANE segmenty
-    (fillery/pauzy juz wyciete, ale w pelni edytowalne - mozesz cofnac kazde ciecie),
-    odwolanie do ORYGINALNEGO pliku przez SOFFS. Druga sciezka = markery ciec.
-    """
-    src = os.path.abspath(source_file).replace("\\", "/")
-    ext = os.path.splitext(source_file)[1].lower()
-    stype = {".mp3": "MP3", ".flac": "FLAC", ".ogg": "VORBIS", ".opus": "VORBIS"}.get(ext, "WAVE")
-    def secs(fr): return fr/sr
-    items = []
-    pos = 0.0  # pozycja na osi czasu projektu (po sklejeniu)
-    for (s, e) in keeps:
-        length = secs(e-s); soffs = secs(s)
-        items.append(f"""    <ITEM
+def _rpp_item(pos, length, soffs, name, src, stype):
+    return f"""    <ITEM
       POSITION {pos:.6f}
       LENGTH {length:.6f}
       SOFFS {soffs:.6f}
-      NAME "segment"
+      NAME "{name}"
       GUID {_rpp_guid()}
       IGUID {_rpp_guid()}
       <SOURCE {stype}
         FILE "{src}"
       >
-    >""")
-        pos += length
-    # markery: gdzie w NOWEJ osi czasu wypadaja sklejenia (miejsca ciec)
-    markers = []
-    mp = 0.0; idx = 1
-    for (s, e) in keeps[:-1]:
-        mp += secs(e-s)
-        markers.append(f'  MARKER {idx} {mp:.6f} "ciecie" 0 0 1 R {_rpp_guid()}')
-        idx += 1
-    cut_total = sum(secs(b-a) for a, b in merged)
+    >"""
+
+def _rpp_document(track_name, items, markers, sr, ripple):
     body = "\n".join(items)
     mk = "\n".join(markers)
-    content = f"""<REAPER_PROJECT 0.1 "7.0/win64" {int(time.time())}
-  RIPPLE 0
+    return f"""<REAPER_PROJECT 0.1 "7.0/win64" {int(time.time())}
+  RIPPLE {ripple}
   GROUPOVERRIDE 0 0 0
   AUTOXFADE 129
   SAMPLERATE {sr} 0 0
@@ -237,7 +217,7 @@ def export_rpp(rpp_path, source_file, keeps, merged, sr):
   TEMPO 120 4 4
 {mk}
   <TRACK {_rpp_guid()}
-    NAME "Czysciciel - material oczyszczony (edytowalny)"
+    NAME "{track_name}"
     TRACKHEIGHT 0 0 0 0 0 0
     <ITEMS
     >
@@ -245,9 +225,67 @@ def export_rpp(rpp_path, source_file, keeps, merged, sr):
   >
 >
 """
+
+def _src_info(source_file):
+    src = os.path.abspath(source_file).replace("\\", "/")
+    ext = os.path.splitext(source_file)[1].lower()
+    stype = {".mp3": "MP3", ".flac": "FLAC", ".ogg": "VORBIS", ".opus": "VORBIS"}.get(ext, "WAVE")
+    return src, stype
+
+def export_rpp(rpp_path, source_file, keeps, merged, sr):
+    """WARIANT GOTOWY (ripple): fillery/pauzy JUZ wyciete, segmenty dosuniete
+    (posklejane), odwolanie do ORYGINALU przez SOFFS. Kazde ciecie w pelni
+    edytowalne (mozesz rozciagnac item, jesli cos wyciete za duzo). Markery
+    na sklejeniach."""
+    src, stype = _src_info(source_file)
+    def secs(fr): return fr/sr
+    items = []; pos = 0.0
+    for (s, e) in keeps:
+        length = secs(e-s)
+        items.append(_rpp_item(pos, length, secs(s), "segment", src, stype))
+        pos += length
+    markers = []; mp = 0.0; idx = 1
+    for (s, e) in keeps[:-1]:
+        mp += secs(e-s)
+        markers.append(f'  MARKER {idx} {mp:.6f} "ciecie" 0 0 1 R {_rpp_guid()}')
+        idx += 1
+    content = _rpp_document("Czysciciel - material oczyszczony (dosuniety)",
+                            items, markers, sr, ripple=0)
     with open(rpp_path, "w", encoding="utf-8") as f:
         f.write(content)
-    log(f"projekt Reapera: {rpp_path} (wycięte {cut_total/60:.1f} min, {len(keeps)} segmentów)")
+    cut_total = sum(secs(b-a) for a, b in merged)
+    log(f"projekt Reapera (gotowy): {rpp_path} (wycięte {cut_total/60:.1f} min, {len(keeps)} segmentów)")
+    return rpp_path
+
+def export_rpp_marked(rpp_path, source_file, keeps, merged, sr):
+    """WARIANT DO PRZEJRZENIA: caly material na osi w ORYGINALNYM ukladzie
+    (nic nie dosuniete), rozbity na itemy. Fragmenty do wyciecia to osobne
+    itemy nazwane 'WYTNIJ N' (czytnik ekranu je odczyta), zachowane to 'zostaw'.
+    Projekt ma wlaczony RIPPLE ALL - skasowanie itemu 'WYTNIJ' automatycznie
+    dosuwa reszte. Jesli uznasz, ze czegos wyciac nie warto - po prostu nie
+    kasujesz tego itemu."""
+    src, stype = _src_info(source_file)
+    def secs(fr): return fr/sr
+    # zbuduj pelna sekwencje segmentow (keep + cut) posortowana po czasie
+    segs = [("keep", s, e) for (s, e) in keeps] + [("cut", s, e) for (s, e) in merged]
+    segs.sort(key=lambda z: z[1])
+    items = []; markers = []; cut_no = 0
+    for typ, s, e in segs:
+        if e <= s: continue
+        if typ == "cut":
+            cut_no += 1
+            name = f"WYTNIJ {cut_no}"
+            # marker na poczatku fragmentu do wyciecia - latwa nawigacja
+            markers.append(f'  MARKER {cut_no} {secs(s):.6f} "WYTNIJ {cut_no}" 0 0 1 R {_rpp_guid()}')
+        else:
+            name = "zostaw"
+        # POSITION = oryginalny czas (bez dosuwania), SOFFS = ten sam = oryginal 1:1
+        items.append(_rpp_item(secs(s), secs(e-s), secs(s), name, src, stype))
+    content = _rpp_document("Czysciciel - do przejrzenia (skasuj itemy WYTNIJ)",
+                            items, markers, sr, ripple=2)  # 2 = ripple all tracks
+    with open(rpp_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    log(f"projekt Reapera (do przejrzenia): {rpp_path} ({cut_no} fragmentów oznaczonych WYTNIJ)")
     return rpp_path
 
 def main():
@@ -287,6 +325,9 @@ def main():
                     help="liczba kanalow wyjscia (domyslnie stereo)")
     ap.add_argument("--eksport", choices=["audio", "reaper", "oba"], default="audio",
                     help="co zapisac: audio / projekt reaper / oba (domyslnie: audio)")
+    ap.add_argument("--wariant-rpp", choices=["gotowy", "przejrzenie", "oba"], default="gotowy",
+                    help="wariant projektu Reapera: gotowy (dosuniety) / przejrzenie "
+                         "(itemy WYTNIJ, ripple) / oba (domyslnie: gotowy)")
     ap.add_argument("--zapisz-wyciete", action="store_true",
                     help="zapisz tez osobny plik z tym, co zostalo wyciete (do odsluchu)")
     # zgodnosc wstecz:
@@ -410,8 +451,14 @@ def main():
         rpp_path = None
         if eksport in ("reaper", "oba"):
             progress(95, "Eksport projektu Reapera...")
-            rpp_path = os.path.join(outdir, stem + ".RPP")
-            export_rpp(rpp_path, ain, keeps, merged, sr)
+            if a.wariant_rpp in ("gotowy", "oba"):
+                rpp_path = os.path.join(outdir, stem + ".RPP")
+                export_rpp(rpp_path, ain, keeps, merged, sr)
+            if a.wariant_rpp in ("przejrzenie", "oba"):
+                rpp_m = os.path.join(outdir, stem + "_do_przejrzenia.RPP")
+                export_rpp_marked(rpp_m, ain, keeps, merged, sr)
+                if rpp_path is None:
+                    rpp_path = rpp_m
 
         if src_wav != ain and os.path.exists(src_wav):
             os.remove(src_wav)
