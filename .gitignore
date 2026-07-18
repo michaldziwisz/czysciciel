@@ -8,6 +8,7 @@ __pycache__/
 # Logi robocze
 build.log
 bootstrap_test.log
+ci_*.log
 
 # Pliki audio i wyniki (nie dystrybuujemy nagrań)
 *.mp3
