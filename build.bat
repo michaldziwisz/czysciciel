@@ -17,11 +17,13 @@ echo === PyInstaller ===
 %PY% -m PyInstaller ^
   --name Czysciciel ^
   --windowed ^
+  --icon assets\czysciciel.ico ^
   --noconfirm ^
   --clean ^
   --add-data "bootstrap.py;." ^
   --add-data "worker.py;." ^
   --add-data "gui.py;." ^
+  --add-data "assets\czysciciel.ico;assets" ^
   --collect-submodules wx ^
   czysciciel.py
 

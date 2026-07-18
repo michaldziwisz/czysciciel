@@ -94,11 +94,21 @@ class MainFrame(wx.Frame):
         self.stop_flag = threading.Event()
         self.runtime_python = None
         self.runtime_ffmpeg = None
+        self._set_icon()
         self._build_ui()
         self.Centre()
         self.Show()
 
     # ---------------- UI ----------------
+    def _set_icon(self):
+        """Ikona okna (pasek zadan, Alt+Tab). Cicho pomija gdy pliku brak."""
+        try:
+            p = resource(os.path.join("assets", "czysciciel.ico"))
+            if os.path.exists(p):
+                self.SetIcon(wx.Icon(p, wx.BITMAP_TYPE_ICO))
+        except Exception:
+            pass
+
     def _build_ui(self):
         panel = wx.Panel(self)
         # akcelerator: SetName wszedzie dla NVDA + StaticText PRZED kontrolka

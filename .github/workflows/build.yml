@@ -34,9 +34,11 @@ jobs:
       - name: Zbuduj launcher (PyInstaller onedir)
         run: |
           pyinstaller --name Czysciciel --windowed --noconfirm --clean `
+            --icon assets/czysciciel.ico `
             --add-data "bootstrap.py;." `
             --add-data "worker.py;." `
             --add-data "gui.py;." `
+            --add-data "assets/czysciciel.ico;assets" `
             --collect-submodules wx `
             czysciciel.py
 
