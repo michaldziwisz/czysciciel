@@ -35,6 +35,11 @@ except Exception:
 # HF_HOME i ffmpeg ustawia GUI/bootstrap przez zmienne srodowiskowe zanim nas odpali.
 os.environ.setdefault("HF_HOME", os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Czysciciel", "hf_cache"))
+# TRYB OFFLINE: model jest juz pobrany raz przez bootstrap. Bez tego transformers
+# przy KAZDYM starcie laczy sie z HuggingFace, by sprawdzic ETag/nowsza wersje -
+# powoduje pauze "cos pobiera z HF" i pada bez internetu. Wymuszamy uzycie cache.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 from itertools import pairwise
 
 MODEL = "classla/wav2vecbert2-filledPause"
@@ -79,9 +84,10 @@ def detect_fillers(y_full):
     half = (dev == "cuda")
     log(f"model na {dev}{' fp16' if half else ''}")
     progress(15, f"Ladowanie modelu ({dev})...")
-    fe = AutoFeatureExtractor.from_pretrained(MODEL)
+    fe = AutoFeatureExtractor.from_pretrained(MODEL, local_files_only=True)
     model = Wav2Vec2BertForAudioFrameClassification.from_pretrained(
-        MODEL, torch_dtype=torch.float16 if half else torch.float32).to(dev)
+        MODEL, torch_dtype=torch.float16 if half else torch.float32,
+        local_files_only=True).to(dev)
     model.eval()
     iv = []; step = int(CHUNK*SR); n = len(y_full)
     nch = (n+step-1)//step
