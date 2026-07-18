@@ -1,79 +1,201 @@
 # Czyściciel
 
-Aplikacja dla Windows do czyszczenia nagrań mowy z wtrąceń „yyy / eee / mmm"
-(fillerów) oraz nadmiernie długich pauz — tak, by brzmiało naturalnie.
-W pełni obsługiwana z klawiatury i czytnika ekranu (NVDA/JAWS).
+**Czyściciel** to program dla Windows, który automatycznie usuwa z nagrań mowy
+wtrącenia typu „yyy", „eee", „mmm" (tzw. fillery) oraz skraca zbyt długie pauzy —
+tak, żeby nagranie brzmiało naturalnie i zwięźle. Idealny do podcastów, audycji,
+wywiadów i wykładów.
 
-Używa modelu AI (`classla/wav2vecbert2-filledPause`), który rozpoznaje fillery
-z samego sygnału dźwiękowego (nie z transkrypcji), działa po polsku i jest
-niezależny od mówcy.
+Program jest w pełni obsługiwany z klawiatury i przez czytniki ekranu
+(NVDA, JAWS) — powstał z myślą o dostępności.
 
-## Najważniejsze cechy
+---
 
-- Wykrywanie i wycinanie fillerów modelem AI.
-- Skracanie zbyt długich pauz z zachowaniem naturalnego oddechu (3 presety).
-- Tryb wsadowy — wiele plików naraz.
-- Eksport projektu **Reapera (.RPP)** do dalszej, niedestrukcyjnej edycji.
-- Automatyczny wybór **GPU (NVIDIA) lub procesora** — bez konfiguracji.
-- Dostępny interfejs (etykiety po polsku, pełna obsługa czytnika ekranu).
+## Co potrafi
 
-## Instalacja i pierwsze uruchomienie
+- **Usuwa fillery** („yyy", „eee", „mmm") rozpoznając je modelem sztucznej
+  inteligencji — z samego dźwięku, nie z transkrypcji. Działa po polsku i
+  niezależnie od tego, kto mówi.
+- **Skraca za długie pauzy**, zostawiając naturalny oddech (trzy poziomy
+  agresywności).
+- **Przetwarza wiele plików naraz** (tryb wsadowy).
+- **Zapisuje w dowolnym formacie**: MP3, AAC, Opus, Ogg Vorbis, WMA, AC3,
+  a także bezstratnie: FLAC, ALAC, WAV. Do tego wybór jakości (bitrate) i
+  liczby kanałów (mono / stereo / jak w źródle).
+- **Eksportuje projekt Reapera (.RPP)** — jeśli chcesz dalej edytować materiał
+  ręcznie, dostajesz gotowy, niedestrukcyjny projekt z zaznaczonymi cięciami.
+- **Wybiera GPU albo procesor automatycznie** — na komputerze z kartą NVIDIA
+  liczy szybciej, bez karty też zadziała.
 
-Nie ma osobnego instalatora. Pobierz folder `Czysciciel` (z sekcji Releases)
-i uruchom `Czysciciel.exe`.
+---
 
-**Pierwsze uruchomienie** dociąga jednorazowo środowisko uruchomieniowe
-(silnik AI + model + ffmpeg) do:
+## Instalacja
+
+Program **nie wymaga instalatora**.
+
+1. Wejdź na stronę [Releases](../../releases) i pobierz plik
+   **`Czysciciel-windows.zip`**.
+2. Rozpakuj go w dowolnym miejscu (np. na Pulpicie albo w `Dokumentach`).
+3. Wejdź do rozpakowanego folderu `Czysciciel` i uruchom **`Czysciciel.exe`**.
+
+### Pierwsze uruchomienie
+
+Przy **pierwszym** starcie Czyściciel jednorazowo pobiera z internetu potrzebne
+składniki (silnik AI, model rozpoznawania mowy i narzędzie do obróbki dźwięku).
+Trafiają one do Twojego profilu użytkownika w folderze:
 
     %LOCALAPPDATA%\Czysciciel
 
-- Na komputerze z kartą **NVIDIA** pobierze wersję GPU (szybsze przetwarzanie).
-- Bez karty NVIDIA pobierze wersję na **procesor** (wolniej, ale działa wszędzie).
-- Rozmiar pobrania: ok. 5 GB (GPU) lub ok. 2,5 GB (CPU). Wymaga internetu
-  tylko przy pierwszym uruchomieniu; potem działa offline.
-- Postęp pokazywany jest na pasku i w dzienniku (czytane przez czytnik ekranu).
+- Na komputerze z kartą **NVIDIA** pobierze wersję GPU (ok. 5 GB) — szybsze
+  przetwarzanie.
+- Bez karty NVIDIA pobierze wersję na **procesor** (ok. 2,5 GB) — działa wszędzie.
+- Postęp pobierania widać na pasku i w dzienniku (są odczytywane przez czytnik
+  ekranu, więc wiesz, że program pracuje, a nie zawiesił się).
 
-Kolejne uruchomienia są natychmiastowe.
+**Internet jest potrzebny tylko raz.** Każde kolejne uruchomienie jest
+natychmiastowe i działa bez sieci.
 
-## Jak używać
+---
 
-1. Dodaj pliki (przycisk „Dodaj pliki..." lub „Dodaj folder...").
-2. Zaznacz na liście te, które chcesz wyczyścić (spacja zaznacza/odznacza).
-3. Wybierz opcje: preset skracania pauz, minimalną długość fillera,
-   ewentualnie „tylko fillery" lub eksport projektu Reapera.
-4. (Opcjonalnie) wskaż folder wyjściowy — domyślnie wynik ląduje obok źródła.
-5. Naciśnij „Wyczyść" (lub F5).
+## Jak używać — krok po kroku
 
-Wynik: `nazwa_czysty.mp3` (192 kbps, 44,1 kHz stereo) oraz `ciecia_nazwa.json`
-z listą wszystkich cięć. Przy włączonej opcji — także `nazwa.RPP`.
+1. **Dodaj nagrania.** Kliknij „Dodaj pliki..." (możesz zaznaczyć wiele naraz)
+   albo „Dodaj folder..." (doda wszystkie nagrania z wybranego folderu).
+2. **Zaznacz, co przetworzyć.** Na liście każdy plik ma pole wyboru —
+   spacja zaznacza i odznacza.
+3. **Wybierz, co wycinać** (sekcja „Co wycinać"):
+   - tylko fillery,
+   - tylko ciszę (za długie pauzy),
+   - fillery i ciszę (domyślnie).
+4. **Dostrój opcje** (opcjonalnie): poziom skracania pauz, minimalną długość
+   fillera, format wyjściowy, jakość i kanały.
+5. **Wybierz, co zapisać** (sekcja „Co zapisać"): sam plik audio, sam projekt
+   Reapera, albo jedno i drugie.
+6. **Wskaż folder wyjściowy** (opcjonalnie) — domyślnie wynik ląduje obok
+   pliku źródłowego.
+7. Naciśnij **„Uruchom czyszczenie"** (lub klawisz **F5**).
 
-### Presety skracania pauz
+Gdy program skończy, pojawi się okno z podsumowaniem (ile plików przetworzono).
+Przyciskiem „Otwórz folder wyniku" szybko przejdziesz do gotowych plików.
 
-| preset       | nie rusza pauz do | dłuższe skraca do | efekt            |
-|--------------|-------------------|-------------------|------------------|
-| zachowawczy  | 0,70 s            | 0,60 s            | ledwo zauważalne |
-| umiarkowany  | 0,50 s            | 0,45 s            | dobry kompromis  |
-| zwarty       | 0,35 s            | 0,30 s            | radiowe tempo    |
+Wynik audio nazywa się `nazwa_czysty.<format>` (np. `wywiad_czysty.mp3`), a obok
+powstaje plik `ciecia_nazwa.json` z listą wszystkich cięć (do wglądu).
 
-Fillery krótsze niż ustawiony próg (domyślnie 0,30 s) są ignorowane — chroni to
-przed wycięciem lekko przeciągniętego „y" w środku słowa.
+---
+
+## Poziomy skracania pauz
+
+| Poziom       | Nie rusza pauz do | Dłuższe skraca do | Efekt              |
+|--------------|-------------------|-------------------|--------------------|
+| zachowawczy  | 0,70 s            | 0,60 s            | ledwo zauważalne   |
+| umiarkowany  | 0,50 s            | 0,45 s            | dobry kompromis    |
+| zwarty       | 0,35 s            | 0,30 s            | radiowe, szybkie tempo |
+
+**Minimalna długość fillera** (domyślnie 0,30 s) chroni przed wycięciem lekko
+przeciągniętego „y" w środku słowa — krótsze wtręty są pomijane.
+
+---
+
+## Formaty wyjściowe
+
+| Format | Rozszerzenie | Rodzaj      | Kiedy wybrać                         |
+|--------|--------------|-------------|--------------------------------------|
+| MP3    | .mp3         | stratny     | uniwersalny, wszędzie działa         |
+| AAC    | .m4a         | stratny     | dobra jakość przy mniejszym pliku    |
+| Opus   | .opus        | stratny     | najlepsza jakość mowy przy niskim bitrate |
+| Ogg Vorbis | .ogg     | stratny     | otwarty format, dobra jakość         |
+| WMA    | .wma         | stratny     | zgodność ze starszym oprogramowaniem |
+| AC3    | .ac3         | stratny     | dźwięk do wideo                      |
+| FLAC   | .flac        | bezstratny  | pełna jakość, mniejszy niż WAV       |
+| ALAC   | .m4a         | bezstratny  | pełna jakość w świecie Apple         |
+| WAV    | .wav         | bezstratny  | surowy materiał do dalszej obróbki   |
+
+Dla formatów stratnych ustawiasz **bitrate** (im wyższy, tym lepsza jakość i
+większy plik). Dla bezstratnych bitrate nie ma znaczenia i jest wyłączony.
+
+---
+
+## Eksport do Reapera
+
+Jeśli chcesz mieć kontrolę nad każdym cięciem, zaznacz eksport projektu Reapera.
+Czyściciel utworzy plik `.RPP`, który:
+
+- odwołuje się do **oryginalnego** nagrania (nic nie jest bezpowrotnie usuwane),
+- ma materiał już poskładany po cięciach, ale **w pełni edytowalny** — każde
+  cięcie możesz cofnąć lub przesunąć,
+- zawiera znaczniki w miejscach cięć, żeby łatwo je odnaleźć.
+
+Wystarczy otworzyć plik `.RPP` w [Reaperze](https://www.reaper.fm/).
+
+---
+
+## Jak to działa (w skrócie)
+
+1. **Rozpoznanie fillerów.** Model `classla/wav2vecbert2-filledPause` analizuje
+   nagranie w kawałkach po 20 milisekund i decyduje, gdzie jest filler. Robi to
+   „ze słuchu" — z sygnału dźwiękowego — dlatego łapie „yyy", których zwykła
+   transkrypcja w ogóle nie zapisuje.
+2. **Wykrycie pauz.** Program mierzy poziom głośności i znajduje zbyt długie
+   ciche fragmenty.
+3. **Cięcie.** Wycinane fragmenty są usuwane płynnie (z delikatnym
+   przenikaniem na łączeniach i marginesem bezpieczeństwa od granic słów), więc
+   nie słychać „przeskoków". Cała operacja zachowuje pełną jakość dźwięku.
+4. **Zapis** w wybranym formacie oraz — opcjonalnie — projekt Reapera.
+
+---
 
 ## Wymagania
 
 - Windows 64-bit.
-- Do wersji GPU: karta NVIDIA ze sterownikiem obsługującym CUDA 12.
-- Połączenie z internetem przy pierwszym uruchomieniu.
+- Wersja GPU: karta NVIDIA ze sterownikiem obsługującym CUDA 12.
+- Połączenie z internetem **przy pierwszym uruchomieniu**.
+- Około 3–6 GB miejsca na dysku (jednorazowo, na pobrane składniki).
 
-## Licencja
+---
 
-Kod: MIT (plik `LICENSE`). Komponenty firm trzecich i ich licencje: plik
-`TRZECIE_STRONY.txt`. Model na licencji Apache-2.0, ffmpeg w wariancie LGPL.
+## Najczęstsze pytania
 
-## Budowanie ze źródeł
+**Czy moje nagrania są gdzieś wysyłane?**
+Nie. Całe przetwarzanie odbywa się na Twoim komputerze. Internet jest używany
+wyłącznie raz — do pobrania składników programu.
 
-Wymaga Windows z Pythonem 3.12, wxPython i PyInstaller:
+**Pierwsze uruchomienie długo pobiera — czy to normalne?**
+Tak. To jednorazowe pobranie kilku gigabajtów. Kolejne starty są natychmiastowe.
 
-    build.bat
+**Nie mam karty NVIDIA — czy program zadziała?**
+Tak, automatycznie użyje procesora. Będzie wolniej, ale wynik jest ten sam.
 
-Wynik: `dist\Czysciciel\Czysciciel.exe` (lekki launcher; ciężkie komponenty
-dociągane przy pierwszym uruchomieniu).
+**Program wyciął za dużo / za mało.**
+Zmień poziom skracania pauz i minimalną długość fillera, albo wybierz tryb
+„tylko fillery" lub „tylko cisza". Zawsze możesz też wyeksportować projekt
+Reapera i dopracować cięcia ręcznie.
+
+---
+
+## Licencja i podziękowania
+
+Kod programu: licencja **MIT** (plik [`LICENSE`](LICENSE)).
+
+Czyściciel korzysta z otwartych komponentów — pełna lista wraz z licencjami jest
+w pliku [`TRZECIE_STRONY.txt`](TRZECIE_STRONY.txt). Najważniejsze:
+
+- model `classla/wav2vecbert2-filledPause` (Apache-2.0),
+- PyTorch, Transformers, librosa, soundfile,
+- ffmpeg (wariant LGPL),
+- wxPython (interfejs).
+
+---
+
+## Dla programistów — budowanie ze źródeł
+
+Wymagany Windows z Pythonem 3.12:
+
+```bat
+pip install wxpython pyinstaller
+build.bat
+```
+
+Wynik: `dist\Czysciciel\Czysciciel.exe` (lekki launcher; ciężkie składniki
+dociągane są przy pierwszym uruchomieniu).
+
+Gotowe paczki buduje też automatycznie GitHub Actions — każdy tag `v*` tworzy
+Release z gotowym plikiem `Czysciciel-windows.zip`.
