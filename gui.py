@@ -204,6 +204,12 @@ class MainFrame(wx.Frame):
         self.rb_eksport.SetName("Co zapisać")
         root.Add(self.rb_eksport, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
+        # opcja dodatkowa: osobny plik z wycietymi fragmentami (do odsluchu)
+        self.cb_wyciete = wx.CheckBox(panel,
+            label="Zapisz też osobny plik z tym, co &wycięte (do odsłuchu)")
+        self.cb_wyciete.SetName("Zapisz osobny plik z wyciętymi fragmentami")
+        root.Add(self.cb_wyciete, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
         # --- folder wyjsciowy ---
         r3 = wx.BoxSizer(wx.HORIZONTAL)
         lbl_out = wx.StaticText(panel, label="Folder &wyjściowy:")
@@ -355,6 +361,9 @@ class MainFrame(wx.Frame):
         self.box_fmt.GetStaticBox().Show(audio_potrzebne)
         for c in (self.ch_format, self.ch_kanaly, self.ch_bitrate, self.lbl_bitrate):
             c.Show(audio_potrzebne)
+        # plik z wycietymi ma sens tylko gdy powstaje audio
+        self.cb_wyciete.Show(audio_potrzebne)
+        self.cb_wyciete.Enable(audio_potrzebne)
         if audio_potrzebne:
             self.on_format_change(None)
         self.Layout()
@@ -373,10 +382,11 @@ class MainFrame(wx.Frame):
         for b in (self.btn_start, self.btn_add, self.btn_addfolder, self.btn_del,
                   self.btn_clear, self.btn_out, self.ch_preset, self.sc_minfiller,
                   self.rb_tryb, self.rb_eksport, self.ch_format, self.ch_kanaly,
-                  self.ch_bitrate):
+                  self.ch_bitrate, self.cb_wyciete):
             b.Enable(not running)
         if not running:
-            self.on_format_change(None)  # przywroc poprawny stan bitrate
+            self.on_format_change(None)   # przywroc poprawny stan bitrate
+            self.on_eksport_change(None)  # przywroc widocznosc/aktywnosc opcji audio
         self.btn_stop.Enable(running)
 
     def on_start(self, evt):
@@ -394,9 +404,11 @@ class MainFrame(wx.Frame):
         fmt = FORMATY_OUT[self.ch_format.GetSelection()][0]
         bitrate = BITRATE_LISTA[self.ch_bitrate.GetSelection()]
         kanaly = ["zrodlo", "mono", "stereo"][self.ch_kanaly.GetSelection()]
+        zapisz_wyciete = self.cb_wyciete.GetValue() and eksport in ("audio", "oba")
         outdir = self.txt_out.GetValue().strip() or None
         opts = dict(preset=preset, minf=minf, tryb=tryb, eksport=eksport,
-                    fmt=fmt, bitrate=bitrate, kanaly=kanaly, outdir=outdir)
+                    fmt=fmt, bitrate=bitrate, kanaly=kanaly, outdir=outdir,
+                    zapisz_wyciete=zapisz_wyciete)
         self.stop_flag.clear()
         self._set_running(True)
         self.gauge.SetValue(0)
@@ -503,6 +515,8 @@ class MainFrame(wx.Frame):
                 "--bitrate", f"{opts['bitrate']}",
                 "--kanaly", opts["kanaly"],
                 "--eksport", opts["eksport"]]
+        if opts.get("zapisz_wyciete"):
+            args.append("--zapisz-wyciete")
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", env=env,
                                 creationflags=self._no_window())

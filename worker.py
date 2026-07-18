@@ -166,6 +166,20 @@ def cut_stream(ain, keeps, aout, sr, ch):
         if tail is not None and len(tail) > 0: fout.write(tail); written += len(tail)
     return written
 
+# ---------- ZAPIS WYCIETYCH FRAGMENTOW (do odsluchu/kontroli) ----------
+def write_removed(ain, merged, aout, sr, ch):
+    """Sklada wszystkie WYCIETE fragmenty (merged, w probkach) w jeden plik,
+    rozdzielone krotka cisza, zeby przy odsluchu bylo slychac granice."""
+    gap = np.zeros((int(0.35*sr), ch), dtype="float32")  # 0.35s ciszy miedzy fragmentami
+    written = 0
+    with sf.SoundFile(ain) as fin, sf.SoundFile(aout, 'w', samplerate=sr, channels=ch, subtype="PCM_16") as fout:
+        for i, (s, e) in enumerate(merged):
+            if e <= s: continue
+            fin.seek(s); block = fin.read(e-s, dtype="float32", always_2d=True)
+            if i > 0: fout.write(gap); written += len(gap)
+            fout.write(block); written += len(block)
+    return written
+
 # ---------- EKSPORT PROJEKTU REAPERA (.RPP) ----------
 def _rpp_guid():
     import uuid
@@ -267,6 +281,8 @@ def main():
                     help="liczba kanalow wyjscia (domyslnie stereo)")
     ap.add_argument("--eksport", choices=["audio", "reaper", "oba"], default="audio",
                     help="co zapisac: audio / projekt reaper / oba (domyslnie: audio)")
+    ap.add_argument("--zapisz-wyciete", action="store_true",
+                    help="zapisz tez osobny plik z tym, co zostalo wyciete (do odsluchu)")
     # zgodnosc wstecz:
     ap.add_argument("--bez-pauz", action="store_true", help="alias --tryb fillery")
     ap.add_argument("--rpp", action="store_true", help="alias --eksport oba")
@@ -341,29 +357,48 @@ def main():
 
         # 4. eksport AUDIO (jesli wybrany)
         if eksport in ("audio", "oba"):
+            # wspolny enkoder WAV -> docelowy format (DRY: czysty i wyciete)
+            def encode(wav_in, out_path, etap):
+                progress(90, etap)
+                log(etap)
+                enc = [ff, "-y", "-i", wav_in, "-c:a", kodek]
+                if stratny:
+                    enc += ["-b:a", f"{a.bitrate}k"]
+                if a.kanaly == "mono":
+                    enc += ["-ac", "1"]
+                elif a.kanaly == "stereo":
+                    enc += ["-ac", "2"]
+                # "zrodlo" = nie wymuszaj kanalow (zostaw jak w materiale)
+                enc.append(out_path)
+                r2 = subprocess.run(enc, capture_output=True, text=True)
+                if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
+                    raise RuntimeError("eksport audio nie powiódł się: " + r2.stderr[-300:])
+
             progress(78, "Cięcie w pełnej jakości...")
             log("tnę strumieniowo w pełnej jakości...")
             wav_out = os.path.join(outdir, stem + "_tmp_czysty.wav")
             written = cut_stream(ain_proc, keeps, wav_out, sr, ch)
             di = info.frames/sr; do = written/sr
             log(f"wycięte: {di:.0f}s -> {do:.0f}s (usunięto {di-do:.0f}s = {(di-do)/60:.1f}min, {len(merged)} cięć)")
-
-            progress(90, f"Eksport {a.format.upper()}...")
-            log(f"eksport {a.format.upper()}...")
-            enc = [ff, "-y", "-i", wav_out, "-c:a", kodek]
-            if stratny:
-                enc += ["-b:a", f"{a.bitrate}k"]
-            if a.kanaly == "mono":
-                enc += ["-ac", "1"]
-            elif a.kanaly == "stereo":
-                enc += ["-ac", "2"]
-            # "zrodlo" = nie wymuszaj kanalow (zostaw jak w materiale)
-            enc.append(aout)
-            re = subprocess.run(enc, capture_output=True, text=True)
-            if not (os.path.exists(aout) and os.path.getsize(aout) > 1000):
-                raise RuntimeError("eksport audio nie powiódł się: " + re.stderr[-300:])
+            encode(wav_out, aout, f"Eksport {a.format.upper()}...")
             if not a.zostaw_wav and os.path.exists(wav_out):
                 os.remove(wav_out)
+
+            # 4b. opcjonalnie: osobny plik z tym, co WYCIETE (do odsluchu/kontroli)
+            if a.zapisz_wyciete and merged:
+                progress(93, "Zapis wyciętych fragmentów...")
+                log(f"zapisuję wycięte fragmenty ({len(merged)} kawałków)...")
+                wav_rm = os.path.join(outdir, stem + "_tmp_wyciete.wav")
+                write_removed(ain_proc, merged, wav_rm, sr, ch)
+                # nazwa wycietych: bazuje na nazwie WEJSCIA (obok <nazwa>_czysty powstaje
+                # <nazwa>_wyciete), niezaleznie od nazwy pliku wyjsciowego
+                out_rm = os.path.join(outdir, stem + "_wyciete." + ext)
+                encode(wav_rm, out_rm, "Eksport wyciętych fragmentów...")
+                if not a.zostaw_wav and os.path.exists(wav_rm):
+                    os.remove(wav_rm)
+                log(f"wycięte zapisane: {out_rm}")
+            elif a.zapisz_wyciete:
+                log("nic nie wycięto - plik z wyciętymi fragmentami pominięty")
 
         # 5. eksport REAPER (jesli wybrany) - odwoluje sie do ORYGINALU wejscia
         rpp_path = None
