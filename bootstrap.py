@@ -23,7 +23,7 @@ Protokol postepu (STDOUT, parsowany przez GUI):
 """
 import os, sys, json, subprocess, shutil, urllib.request, zipfile, tempfile, ssl, time
 
-RUNTIME_VER = "2"
+RUNTIME_VER = "3"
 
 # --- przypiete wersje (zgodne z dzialajacym cleaner/.venv) ---
 PKGS_COMMON = [
@@ -132,6 +132,26 @@ def _run(cmd, desc, env=None):
 
 UPDATE_EVERY_DAYS = 7  # jak czesto sprawdzac aktualizacje modelu
 
+def _rmtree(path, label):
+    if os.path.isdir(path):
+        blog(f"sprzatam stare: {label}")
+        shutil.rmtree(path, ignore_errors=True)
+
+def cleanup_stale(P):
+    """Przy zmianie RUNTIME_VER: usun STARE srodowisko, zeby nie rosl smietnik
+    (stary torch w venv, stary cache HF, stary model ktory mogl miec zbedne pliki
+    treningowe jak optimizer.pt 4.4GB). Wszystko odtworzy sie czysto."""
+    _rmtree(P["venv"], "stare srodowisko Pythona (venv)")
+    _rmtree(P["hf"], "stary cache modelu (hf_cache)")
+    _rmtree(os.path.join(P["runtime"], "hf_cache"), "stary cache w runtime")
+    _rmtree(P["model"], "stary model (odtworzony bez zbednych plikow)")
+
+def cleanup_uv_cache(P):
+    """uv_cache to tylko cache POBIERANIA paczek (~kilka GB przy torch). Do
+    dzialania niepotrzebny - kasujemy po udanej instalacji. Kolejny bump i tak
+    pobierze na nowo."""
+    _rmtree(os.path.join(P["root"], "uv_cache"), "cache pobierania paczek (uv_cache)")
+
 def maybe_update_model(P, env):
     """Sprawdza aktualizacje modelu NAJWYZEJ raz na UPDATE_EVERY_DAYS dni.
     snapshot_download sciaga TYLKO zmienione/nowe pliki (ETag) - gdy nic sie nie
@@ -192,6 +212,13 @@ def ensure(force_device=None):
                 env["VIRTUAL_ENV"] = P["venv"]
                 maybe_update_model(P, env)
                 return P["vpy"], P["ffmpeg"]
+            else:
+                # READY istnieje ale wersja srodowiska sie zmienila (bump RUNTIME_VER)
+                # -> usun STARE zanim zainstalujemy nowe, inaczej rosnie smietnik
+                blog(f"nowa wersja srodowiska ({meta.get('ver')} -> {RUNTIME_VER}) - przebudowa")
+                try: os.remove(P["ready"])
+                except Exception: pass
+                cleanup_stale(P)
         except Exception:
             pass
 
@@ -251,21 +278,35 @@ def ensure(force_device=None):
     # 6. model - do PLASKIEGO katalogu (local_dir), bez struktury cache HF/symlinkow.
     # Na Windows bez Developer Mode symlinki cache nie dzialaly i preprocessor_config.json
     # bywal nieczytelny -> "Can't load feature extractor". Plaski katalog to eliminuje.
+    # allow_patterns: repo ma pliki TRENINGOWE (optimizer.pt 4.4GB, scheduler/rng/trainer)
+    # zbedne do inferencji - pobieramy TYLKO to co potrzebne. local_dir_use_symlinks=False +
+    # HF_HUB_DISABLE... -> nie trzymaj drugiej kopii w cache (bez tego model wazyl 2x).
     boot(82, "Pobieranie modelu AI (~2.2 GB)...")
     dl = os.path.join(P["runtime"], "_dlmodel.py")
     with open(dl, "w", encoding="utf-8") as f:
         f.write(
+            "import os\n"
+            "os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING']='1'\n"
+            f"os.environ['HF_HOME']=r'{P['hf']}'\n"   # jawnie: cache w znanym miejscu
             "from huggingface_hub import snapshot_download\n"
-            f"p=snapshot_download('{MODEL}', local_dir=r'{P['model']}')\n"
+            "ALLOW=['*.json','*.safetensors','*.txt','tokenizer*','vocab*','merges*','*.model']\n"
+            f"p=snapshot_download('{MODEL}', local_dir=r'{P['model']}',\n"
+            "    allow_patterns=ALLOW)\n"
             "print('MODEL_OK', p)\n"
         )
     _run([P["vpy"], dl], "pobieranie modelu", env=env)
     os.remove(dl)
+    # snapshot_download zaklada cache - skasuj wszystkie mozliwe lokalizacje
+    # (model gotowy w P['model']). Historyczne: bywal w runtime/hf_cache.
+    _rmtree(P["hf"], "cache pobierania modelu (hf_cache)")
+    _rmtree(os.path.join(P["runtime"], "hf_cache"), "stary cache w runtime")
     boot(98, "Model pobrany")
 
     # marker gotowosci
     json.dump({"ver": RUNTIME_VER, "device": device, "ts": int(time.time())},
               open(P["ready"], "w", encoding="utf-8"))
+    # instalacja skonczona - cache pobierania paczek juz niepotrzebny (kilka GB)
+    cleanup_uv_cache(P)
     boot(100, "Instalacja zakonczona")
     blog("srodowisko gotowe - kolejne uruchomienia beda natychmiastowe")
     return P["vpy"], P["ffmpeg"]
