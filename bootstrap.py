@@ -9,7 +9,7 @@ i przygotowuje wszystko do dzialania offline przy kolejnych startach:
 
   1. uv (maly, samodzielny instalator Pythona/pakietow od Astral) -> tools/uv.exe
   2. standalone Python + venv (uv sam pobiera Pythona 3.12)
-  3. torch: CUDA (cu121) jesli wykryto karte NVIDIA, inaczej CPU-only (~200 MB)
+  3. torch: CUDA (cu128, obsluga RTX 20xx-50xx) jesli wykryto karte NVIDIA, inaczej CPU-only (~200 MB)
   4. transformers / librosa / soundfile / pandas / numpy / huggingface_hub
   5. ffmpeg (statyczny build LGPL) -> tools/ffmpeg.exe
   6. model classla/wav2vecbert2-filledPause (~2.2 GB) -> hf_cache
