@@ -191,11 +191,14 @@ def _rpp_guid():
     import uuid
     return "{" + str(uuid.uuid4()).upper() + "}"
 
-def _rpp_item(pos, length, soffs, name, src, stype):
+def _rpp_item(pos, length, soffs, name, src, stype, fin=0.0, fout=0.0):
+    # FADEIN/FADEOUT: ksztalt 1 (rowna moc) + dlugosc w s -> crossfade na nalozeniu
     return f"""    <ITEM
       POSITION {pos:.6f}
       LENGTH {length:.6f}
       SOFFS {soffs:.6f}
+      FADEIN 1 {fin:.6f} 0 1 0 0 0
+      FADEOUT 1 {fout:.6f} 0 1 0 0 0
       NAME "{name}"
       GUID {_rpp_guid()}
       IGUID {_rpp_guid()}
@@ -207,10 +210,12 @@ def _rpp_item(pos, length, soffs, name, src, stype):
 def _rpp_document(track_name, items, markers, sr, ripple):
     body = "\n".join(items)
     mk = "\n".join(markers)
+    # UWAGA: itemy ida BEZPOSREDNIO do TRACK. Nie ma kontenera <ITEMS> - Reaper
+    # zglaszalby go jako 'element not understood'.
     return f"""<REAPER_PROJECT 0.1 "7.0/win64" {int(time.time())}
   RIPPLE {ripple}
   GROUPOVERRIDE 0 0 0
-  AUTOXFADE 129
+  AUTOXFADE 1
   SAMPLERATE {sr} 0 0
   <RECORD_CFG
   >
@@ -219,8 +224,6 @@ def _rpp_document(track_name, items, markers, sr, ripple):
   <TRACK {_rpp_guid()}
     NAME "{track_name}"
     TRACKHEIGHT 0 0 0 0 0 0
-    <ITEMS
-    >
 {body}
   >
 >
@@ -233,20 +236,24 @@ def _src_info(source_file):
     return src, stype
 
 def export_rpp(rpp_path, source_file, keeps, merged, sr):
-    """WARIANT GOTOWY (ripple): fillery/pauzy JUZ wyciete, segmenty dosuniete
-    (posklejane), odwolanie do ORYGINALU przez SOFFS. Kazde ciecie w pelni
-    edytowalne (mozesz rozciagnac item, jesli cos wyciete za duzo). Markery
-    na sklejeniach."""
+    """WARIANT GOTOWY: fillery/pauzy JUZ wyciete, segmenty dosuniete z CROSSFADEM
+    na zlaczeniach (te same 25ms co plik audio z ffmpega - brzmi tak samo plynnie).
+    Kolejne itemy NAKLADAJA sie o XF_MS i maja fade in/out => crossfade. Odwolanie
+    do ORYGINALU przez SOFFS, wiec kazde ciecie mozna cofnac/rozciagnac."""
     src, stype = _src_info(source_file)
     def secs(fr): return fr/sr
-    items = []; pos = 0.0
-    for (s, e) in keeps:
-        length = secs(e-s)
-        items.append(_rpp_item(pos, length, secs(s), "segment", src, stype))
-        pos += length
+    xf = XF_MS / 1000.0
+    items = []; pos = 0.0; n = len(keeps)
+    for idx, (s, e) in enumerate(keeps):
+        length = secs(e - s)
+        fin = xf if idx > 0 else 0.0            # crossfade z poprzednim
+        fout = xf if idx < n-1 else 0.0         # crossfade z nastepnym
+        items.append(_rpp_item(pos, length, secs(s), "segment", src, stype, fin, fout))
+        # nastepny item startuje xf PRZED koncem tego => nalozenie = crossfade
+        pos += length - (xf if idx < n-1 else 0.0)
     markers = []; mp = 0.0; idx = 1
     for (s, e) in keeps[:-1]:
-        mp += secs(e-s)
+        mp += secs(e-s) - xf
         markers.append(f'  MARKER {idx} {mp:.6f} "ciecie" 0 0 1 R {_rpp_guid()}')
         idx += 1
     content = _rpp_document("Czysciciel - material oczyszczony (dosuniety)",
