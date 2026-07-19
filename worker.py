@@ -44,12 +44,21 @@ from itertools import pairwise
 
 MODEL = "classla/wav2vecbert2-filledPause"
 # Sciezka do PLASKIEGO katalogu modelu (bootstrap pobiera go tam przez local_dir).
-# GUI ustawia CZYSCICIEL_MODEL_DIR; gdy jej brak (uruchomienie z CLI), spadamy na repo-id.
-MODEL_DIR = os.environ.get("CZYSCICIEL_MODEL_DIR", "").strip()
+# GUI ustawia CZYSCICIEL_MODEL_DIR; niezaleznie liczymy tez domyslna z LOCALAPPDATA
+# (odpornosc na blad sciezki w GUI - kandydatow probujemy po kolei).
+def _model_candidates():
+    cands = []
+    md = os.environ.get("CZYSCICIEL_MODEL_DIR", "").strip()
+    if md: cands.append(md)
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    cands.append(os.path.join(base, "Czysciciel", "model"))
+    return cands
 def _model_ref():
-    """Zwraca (sciezka/repo, local_files_only). Preferuj lokalny plaski katalog."""
-    if MODEL_DIR and os.path.exists(os.path.join(MODEL_DIR, "preprocessor_config.json")):
-        return MODEL_DIR, True
+    """Zwraca (sciezka/repo, local_files_only). Preferuj lokalny plaski katalog;
+    sprawdz WSZYSTKICH kandydatow (env + domyslny), inaczej spadnij na repo-id."""
+    for d in _model_candidates():
+        if os.path.exists(os.path.join(d, "preprocessor_config.json")):
+            return d, True
     return MODEL, True
 SR = 16000; CHUNK = 30.0; FS = 0.020
 CUT = 0.30                 # min dlugosc fillera

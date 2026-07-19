@@ -523,7 +523,10 @@ class MainFrame(wx.Frame):
     def _run_worker(self, vpy, ff, fin, fout, opts):
         env = os.environ.copy()
         env["FFMPEG_BIN"] = ff
-        root = os.path.dirname(os.path.dirname(os.path.dirname(vpy)))  # ...\Czysciciel
+        # root = %LOCALAPPDATA%\Czysciciel (NIE licz dirname od vpy - vpy jest 4 poziomy
+        # gleboko: ...\Czysciciel\runtime\venv\Scripts\python.exe; wczesniej 3x dirname
+        # dawalo ...\runtime\model = zla sciezka -> model nieznaleziony -> pad offline).
+        root = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
         env["HF_HOME"] = os.path.join(root, "hf_cache")
         env["CZYSCICIEL_MODEL_DIR"] = os.path.join(root, "model")  # plaski katalog modelu
         args = [vpy, helper_script("worker.py"), fin, fout,
