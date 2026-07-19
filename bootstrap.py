@@ -23,7 +23,7 @@ Protokol postepu (STDOUT, parsowany przez GUI):
 """
 import os, sys, json, subprocess, shutil, urllib.request, zipfile, tempfile, ssl, time
 
-RUNTIME_VER = "1"
+RUNTIME_VER = "2"
 
 # --- przypiete wersje (zgodne z dzialajacym cleaner/.venv) ---
 PKGS_COMMON = [
@@ -34,8 +34,11 @@ PKGS_COMMON = [
     "numpy==2.4.6",
     "huggingface_hub==1.24.0",
 ]
-TORCH_VER = "torch==2.5.1"
-TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu121"
+# torch: cu128 obejmuje karty od sm_75 (RTX 20xx) po sm_120 (RTX 50xx Blackwell).
+# cu121 (do 2.5.1) NIE mial sm_120 - RTX 50xx padal "no kernel image". 2.7.0 to
+# pierwszy cu128 z Blackwell. CPU-only osobno (male ~200MB).
+TORCH_VER = "torch==2.7.0"
+TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
 TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 
 UV_URL = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
@@ -58,6 +61,7 @@ def _paths():
         "tools": os.path.join(root, "tools"),
         "venv": os.path.join(root, "runtime", "venv"),
         "hf": os.path.join(root, "hf_cache"),
+        "model": os.path.join(root, "model"),  # PLASKI katalog modelu (bez symlinkow cache)
         "ready": os.path.join(root, "runtime", "READY"),
         "uv": os.path.join(root, "tools", "uv.exe"),
         "ffmpeg": os.path.join(root, "tools", "ffmpeg.exe"),
@@ -145,10 +149,9 @@ def maybe_update_model(P, env):
     with open(dl, "w", encoding="utf-8") as f:
         f.write(
             "import os, sys\n"
-            f"os.environ['HF_HOME']=r'{P['hf']}'\n"
             "try:\n"
             "    from huggingface_hub import snapshot_download\n"
-            f"    snapshot_download('{MODEL}', etag_timeout=10)\n"
+            f"    snapshot_download('{MODEL}', local_dir=r'{P['model']}', etag_timeout=10)\n"
             "    print('UPD_OK')\n"
             "except Exception as e:\n"
             "    print('UPD_SKIP', repr(e)[:120]); sys.exit(0)\n"
@@ -245,15 +248,15 @@ def ensure(force_device=None):
         os.remove(z)
     boot(80, "ffmpeg gotowy")
 
-    # 6. model
+    # 6. model - do PLASKIEGO katalogu (local_dir), bez struktury cache HF/symlinkow.
+    # Na Windows bez Developer Mode symlinki cache nie dzialaly i preprocessor_config.json
+    # bywal nieczytelny -> "Can't load feature extractor". Plaski katalog to eliminuje.
     boot(82, "Pobieranie modelu AI (~2.2 GB)...")
     dl = os.path.join(P["runtime"], "_dlmodel.py")
     with open(dl, "w", encoding="utf-8") as f:
         f.write(
-            "import os\n"
-            f"os.environ['HF_HOME']=r'{P['hf']}'\n"
             "from huggingface_hub import snapshot_download\n"
-            f"p=snapshot_download('{MODEL}')\n"
+            f"p=snapshot_download('{MODEL}', local_dir=r'{P['model']}')\n"
             "print('MODEL_OK', p)\n"
         )
     _run([P["vpy"], dl], "pobieranie modelu", env=env)

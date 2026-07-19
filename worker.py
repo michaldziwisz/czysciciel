@@ -43,6 +43,14 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 from itertools import pairwise
 
 MODEL = "classla/wav2vecbert2-filledPause"
+# Sciezka do PLASKIEGO katalogu modelu (bootstrap pobiera go tam przez local_dir).
+# GUI ustawia CZYSCICIEL_MODEL_DIR; gdy jej brak (uruchomienie z CLI), spadamy na repo-id.
+MODEL_DIR = os.environ.get("CZYSCICIEL_MODEL_DIR", "").strip()
+def _model_ref():
+    """Zwraca (sciezka/repo, local_files_only). Preferuj lokalny plaski katalog."""
+    if MODEL_DIR and os.path.exists(os.path.join(MODEL_DIR, "preprocessor_config.json")):
+        return MODEL_DIR, True
+    return MODEL, True
 SR = 16000; CHUNK = 30.0; FS = 0.020
 CUT = 0.30                 # min dlugosc fillera
 KEEP = 0.50; TARGET = 0.45 # pauzy: do KEEP zostaw, dluzsze skroc do TARGET
@@ -84,10 +92,11 @@ def detect_fillers(y_full):
     half = (dev == "cuda")
     log(f"model na {dev}{' fp16' if half else ''}")
     progress(15, f"Ladowanie modelu ({dev})...")
-    fe = AutoFeatureExtractor.from_pretrained(MODEL, local_files_only=True)
+    ref, lfo = _model_ref()
+    fe = AutoFeatureExtractor.from_pretrained(ref, local_files_only=lfo)
     model = Wav2Vec2BertForAudioFrameClassification.from_pretrained(
-        MODEL, torch_dtype=torch.float16 if half else torch.float32,
-        local_files_only=True).to(dev)
+        ref, torch_dtype=torch.float16 if half else torch.float32,
+        local_files_only=lfo).to(dev)
     model.eval()
     iv = []; step = int(CHUNK*SR); n = len(y_full)
     nch = (n+step-1)//step

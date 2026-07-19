@@ -525,6 +525,7 @@ class MainFrame(wx.Frame):
         env["FFMPEG_BIN"] = ff
         root = os.path.dirname(os.path.dirname(os.path.dirname(vpy)))  # ...\Czysciciel
         env["HF_HOME"] = os.path.join(root, "hf_cache")
+        env["CZYSCICIEL_MODEL_DIR"] = os.path.join(root, "model")  # plaski katalog modelu
         args = [vpy, helper_script("worker.py"), fin, fout,
                 "-p", opts["preset"],
                 "--min-filler", f"{opts['minf']}",
