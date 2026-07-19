@@ -404,22 +404,41 @@ def main():
 
         # 4. eksport AUDIO (jesli wybrany)
         if eksport in ("audio", "oba"):
+            # formaty (klucze), ktore sensownie przenosza okladke (attached_pic)
+            cover_ok = a.format in ("mp3", "aac", "alac", "flac")
             # wspolny enkoder WAV -> docelowy format (DRY: czysty i wyciete)
+            # tagi (tytul/wykonawca/album...) i okladke kopiujemy z ORYGINALU wejscia
             def encode(wav_in, out_path, etap):
                 progress(90, etap)
                 log(etap)
-                enc = [ff, "-y", "-i", wav_in, "-c:a", kodek]
+                # 2 wejscia: [0]=czysty WAV (audio), [1]=oryginal (zrodlo tagow/okladki)
+                enc = [ff, "-y", "-i", wav_in, "-i", ain]
+                enc += ["-map", "0:a"]
+                if cover_ok:
+                    enc += ["-map", "1:v?"]          # okladka jesli istnieje (opcjonalnie)
+                enc += ["-map_metadata", "1"]        # tagi tekstowe z oryginalu
+                enc += ["-c:a", kodek]
                 if stratny:
                     enc += ["-b:a", f"{a.bitrate}k"]
                 if a.kanaly == "mono":
                     enc += ["-ac", "1"]
                 elif a.kanaly == "stereo":
                     enc += ["-ac", "2"]
-                # "zrodlo" = nie wymuszaj kanalow (zostaw jak w materiale)
+                if cover_ok:
+                    enc += ["-c:v", "copy", "-disposition:v", "attached_pic"]
                 enc.append(out_path)
                 r2 = subprocess.run(enc, capture_output=True, text=True)
+                # fallback: gdyby przenoszenie tagow/okladki zawiodlo, sprobuj bez nich
                 if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
-                    raise RuntimeError("eksport audio nie powiódł się: " + r2.stderr[-300:])
+                    log("kopiowanie tagów nie powiodło się - eksport bez tagów")
+                    enc2 = [ff, "-y", "-i", wav_in, "-c:a", kodek]
+                    if stratny: enc2 += ["-b:a", f"{a.bitrate}k"]
+                    if a.kanaly == "mono": enc2 += ["-ac", "1"]
+                    elif a.kanaly == "stereo": enc2 += ["-ac", "2"]
+                    enc2.append(out_path)
+                    r2 = subprocess.run(enc2, capture_output=True, text=True)
+                    if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
+                        raise RuntimeError("eksport audio nie powiódł się: " + r2.stderr[-300:])
 
             progress(78, "Cięcie w pełnej jakości...")
             log("tnę strumieniowo w pełnej jakości...")
