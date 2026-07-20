@@ -60,6 +60,11 @@ UV_URL = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-
 # ffmpeg statyczny (LGPL) - build BtbN. release/latest niezmiennie dostepny.
 FFMPEG_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip"
 MODEL = "classla/wav2vecbert2-filledPause"
+# Model wykrywania MUZYKI (AST/AudioSet). Sluzy do CHRONIENIA fragmentow z muzyka:
+# worker nie wycina fillerow/pauz tam, gdzie gra muzyka. ~350 MB (safetensors).
+# Dociagany NIEZALEZNIE od RUNTIME_VER (istniejace instalacje dostana go bez
+# przebudowy calego srodowiska torch).
+MUSIC_MODEL = "MIT/ast-finetuned-audioset-10-10-0.4593"
 
 def blog(m): print(f"BLOG|{m}", flush=True)
 def boot(pct, msg): print(f"BOOT|{int(pct)}|{msg}", flush=True)
@@ -77,6 +82,7 @@ def _paths():
         "venv": os.path.join(root, "runtime", "venv"),
         "hf": os.path.join(root, "hf_cache"),
         "model": os.path.join(root, "model"),  # PLASKI katalog modelu (bez symlinkow cache)
+        "music_model": os.path.join(root, "music_model"),  # PLASKI katalog modelu muzyki (AST)
         "ready": os.path.join(root, "runtime", "READY"),
         "uv": os.path.join(root, "tools", "uv.exe"),
         "ffmpeg": os.path.join(root, "tools", "ffmpeg.exe"),
@@ -160,6 +166,7 @@ def cleanup_stale(P):
     _rmtree(P["hf"], "stary cache modelu (hf_cache)")
     _rmtree(os.path.join(P["runtime"], "hf_cache"), "stary cache w runtime")
     _rmtree(P["model"], "stary model (odtworzony bez zbednych plikow)")
+    _rmtree(P["music_model"], "stary model muzyki (odtworzony)")
 
 def cleanup_uv_cache(P):
     """uv_cache to tylko cache POBIERANIA paczek (~kilka GB przy torch). Do
@@ -208,6 +215,50 @@ def maybe_update_model(P, env):
     except Exception:
         pass
 
+def ensure_music_model(P, env):
+    """Dociaga model wykrywania MUZYKI (AST) do PLASKIEGO katalogu music_model, jesli
+    go jeszcze nie ma. NIEZALEZNE od RUNTIME_VER - istniejaca instalacja (torch+venv
+    juz gotowe) dostaje ten model przy najblizszym starcie bez przebudowy srodowiska.
+    Idempotentne: obecnosc preprocessor_config.json = gotowe, nic nie robimy.
+    Brak sieci/blad = cicha rezygnacja (worker sam sobie poradzi - bez muzyki nie
+    filtruje, ale i tak dziala)."""
+    cfg = os.path.join(P["music_model"], "preprocessor_config.json")
+    if os.path.exists(cfg):
+        return  # juz jest
+    boot(85, "Pobieranie modelu wykrywania muzyki (~350 MB)...")
+    blog("pobieram model wykrywania muzyki (AST) - jednorazowo")
+    dl = os.path.join(P["runtime"], "_dlmusic.py")
+    with open(dl, "w", encoding="utf-8") as f:
+        f.write(
+            "import os, sys\n"
+            "os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING']='1'\n"
+            f"os.environ['HF_HOME']=r'{P['hf']}'\n"
+            "try:\n"
+            "    from huggingface_hub import snapshot_download\n"
+            "    ALLOW=['*.json','*.safetensors','*.txt','tokenizer*','vocab*','merges*','*.model']\n"
+            f"    p=snapshot_download('{MUSIC_MODEL}', local_dir=r'{P['music_model']}',\n"
+            "        allow_patterns=ALLOW)\n"
+            "    print('MUSIC_OK', p)\n"
+            "except Exception as e:\n"
+            "    print('MUSIC_SKIP', repr(e)[:160]); sys.exit(0)\n"
+        )
+    try:
+        r = subprocess.run([P["vpy"], dl], capture_output=True, text=True, env=env, timeout=600, **_win_kw())
+        if "MUSIC_OK" in (r.stdout or ""):
+            blog("model wykrywania muzyki gotowy")
+        else:
+            blog("nie udalo sie pobrac modelu muzyki - dzialam bez ochrony muzyki "
+                 + (r.stdout or "").strip()[-160:])
+    except Exception as e:
+        blog(f"pobieranie modelu muzyki pominiete ({e!r}) - dzialam bez ochrony muzyki")
+    finally:
+        try: os.remove(dl)
+        except Exception: pass
+    # sprzatanie cache pobierania (model gotowy w plaskim katalogu)
+    _rmtree(P["hf"], "cache pobierania modelu muzyki (hf_cache)")
+    _rmtree(os.path.join(P["runtime"], "hf_cache"), "stary cache w runtime")
+
+
 def ensure(force_device=None):
     """Glowna funkcja. force_device: None(auto)/'cuda'/'cpu'. Zwraca (vpy, ffmpeg)."""
     P = _paths()
@@ -225,7 +276,10 @@ def ensure(force_device=None):
                 # okresowe, nieblokujace sprawdzenie aktualizacji modelu
                 env = os.environ.copy()
                 env["VIRTUAL_ENV"] = P["venv"]
+                # dociagnij model muzyki, jesli to instalacja sprzed tej funkcji
+                ensure_music_model(P, env)
                 maybe_update_model(P, env)
+                boot(100, "Srodowisko gotowe")
                 return P["vpy"], P["ffmpeg"]
             else:
                 # READY istnieje ale wersja srodowiska sie zmienila (bump RUNTIME_VER)
@@ -315,7 +369,11 @@ def ensure(force_device=None):
     # (model gotowy w P['model']). Historyczne: bywal w runtime/hf_cache.
     _rmtree(P["hf"], "cache pobierania modelu (hf_cache)")
     _rmtree(os.path.join(P["runtime"], "hf_cache"), "stary cache w runtime")
-    boot(98, "Model pobrany")
+    boot(84, "Model pobrany")
+
+    # 6b. model wykrywania MUZYKI (AST, ~350 MB) - do plaskiego katalogu music_model
+    ensure_music_model(P, env)
+    boot(98, "Modele pobrane")
 
     # marker gotowosci
     json.dump({"ver": RUNTIME_VER, "device": device, "ts": int(time.time())},

@@ -223,6 +223,30 @@ class MainFrame(wx.Frame):
         self.cb_wyciete.SetName("Zapisz osobny plik z wyciętymi fragmentami")
         root.Add(self.cb_wyciete, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
+        # ochrona muzyki: NIE wycinaj fillerow/pauz z fragmentow, w ktorych gra muzyka
+        # (model fillerow myli spiew/instrumenty z "yyy"). Domyslnie WLACZONE.
+        self.cb_muzyka = wx.CheckBox(panel,
+            label="Pomijaj fragmenty z &muzyką (nie tnij, gdy gra muzyka)")
+        self.cb_muzyka.SetValue(True)
+        self.cb_muzyka.SetName("Pomijaj fragmenty z muzyką")
+        root.Add(self.cb_muzyka, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # suwak czulosci wykrywania muzyki (0..100%). 100 = maks czulosc, chroni kazdy
+        # slad muzyki; 0 = wylaczone, tnie wszedzie. Prog modelu = 1 - czulosc/100.
+        rm = wx.BoxSizer(wx.HORIZONTAL)
+        self.lbl_prog = wx.StaticText(panel, label="Czuł&ość wykrywania muzyki:")
+        rm.Add(self.lbl_prog, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.sl_muzyka = wx.Slider(panel, value=50, minValue=0, maxValue=100,
+                                   style=wx.SL_HORIZONTAL)
+        self.sl_muzyka.SetName("Czułość wykrywania muzyki w procentach. 100 chroni najwięcej, 0 wyłącza")
+        rm.Add(self.sl_muzyka, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.lbl_prog_val = wx.StaticText(panel, label="50%")
+        self.lbl_prog_val.SetName("Wartość czułości")
+        rm.Add(self.lbl_prog_val, 0, wx.ALIGN_CENTER_VERTICAL)
+        root.Add(rm, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        self.sl_muzyka.Bind(wx.EVT_SLIDER, self.on_prog_change)
+        self.cb_muzyka.Bind(wx.EVT_CHECKBOX, self.on_muzyka_toggle)
+
         # --- folder wyjsciowy ---
         r3 = wx.BoxSizer(wx.HORIZONTAL)
         lbl_out = wx.StaticText(panel, label="Folder &wyjściowy:")
@@ -367,6 +391,16 @@ class MainFrame(wx.Frame):
         self.ch_bitrate.Enable(stratny)
         self.lbl_bitrate.Enable(stratny)
 
+    def on_prog_change(self, evt):
+        """Etykieta czulosci w procentach obok suwaka."""
+        self.lbl_prog_val.SetLabel(f"{self.sl_muzyka.GetValue()}%")
+
+    def on_muzyka_toggle(self, evt):
+        """Suwak progu aktywny tylko gdy ochrona muzyki wlaczona."""
+        on = self.cb_muzyka.GetValue()
+        for c in (self.sl_muzyka, self.lbl_prog, self.lbl_prog_val):
+            c.Enable(on)
+
     def on_eksport_change(self, evt):
         """Ustawienia audio widoczne gdy powstaje audio; wariant RPP - gdy powstaje reaper."""
         eksport = EKSPORTY[self.rb_eksport.GetSelection()][0]
@@ -389,6 +423,7 @@ class MainFrame(wx.Frame):
         wx.MessageBox(
             APP_TITLE + " - czyszczenie audio z fillerów (yyy/eee) i nadmiarowych pauz.\n\n"
             "Model: classla/wav2vecbert2-filledPause (Apache-2.0).\n"
+            "Wykrywanie muzyki: MIT/ast-finetuned-audioset (BSD-3-Clause).\n"
             "Silnik AI: PyTorch + Transformers. Audio: ffmpeg (LGPL), librosa, soundfile.\n\n"
             "Działa na karcie NVIDIA (szybciej) lub na procesorze.\n"
             "Środowisko instaluje się raz przy pierwszym uruchomieniu.",
@@ -399,11 +434,13 @@ class MainFrame(wx.Frame):
         for b in (self.btn_start, self.btn_add, self.btn_addfolder, self.btn_del,
                   self.btn_clear, self.btn_out, self.ch_preset, self.sc_minfiller,
                   self.rb_tryb, self.rb_eksport, self.ch_format, self.ch_kanaly,
-                  self.ch_bitrate, self.cb_wyciete, self.rb_wariant):
+                  self.ch_bitrate, self.cb_wyciete, self.cb_muzyka, self.sl_muzyka,
+                  self.rb_wariant):
             b.Enable(not running)
         if not running:
             self.on_format_change(None)   # przywroc poprawny stan bitrate
             self.on_eksport_change(None)  # przywroc widocznosc/aktywnosc opcji audio
+            self.on_muzyka_toggle(None)   # suwak progu wg stanu checkboxa muzyki
         self.btn_stop.Enable(running)
 
     def on_start(self, evt):
@@ -422,11 +459,15 @@ class MainFrame(wx.Frame):
         bitrate = BITRATE_LISTA[self.ch_bitrate.GetSelection()]
         kanaly = ["zrodlo", "mono", "stereo"][self.ch_kanaly.GetSelection()]
         zapisz_wyciete = self.cb_wyciete.GetValue() and eksport in ("audio", "oba")
+        omijaj_muzyke = self.cb_muzyka.GetValue()
+        # suwak = czulosc 0..100%; prog modelu odwrotnie: 100% czulosci -> prog 0.0
+        prog_muzyki = 1.0 - self.sl_muzyka.GetValue() / 100.0
         wariant_rpp = WARIANTY_RPP[self.rb_wariant.GetSelection()][0]
         outdir = self.txt_out.GetValue().strip() or None
         opts = dict(preset=preset, minf=minf, tryb=tryb, eksport=eksport,
                     fmt=fmt, bitrate=bitrate, kanaly=kanaly, outdir=outdir,
-                    zapisz_wyciete=zapisz_wyciete, wariant_rpp=wariant_rpp)
+                    zapisz_wyciete=zapisz_wyciete, wariant_rpp=wariant_rpp,
+                    omijaj_muzyke=omijaj_muzyke, prog_muzyki=prog_muzyki)
         self.stop_flag.clear()
         self._set_running(True)
         self.gauge.SetValue(0)
@@ -529,6 +570,7 @@ class MainFrame(wx.Frame):
         root = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
         env["HF_HOME"] = os.path.join(root, "hf_cache")
         env["CZYSCICIEL_MODEL_DIR"] = os.path.join(root, "model")  # plaski katalog modelu
+        env["CZYSCICIEL_MUSIC_MODEL_DIR"] = os.path.join(root, "music_model")  # model muzyki (AST)
         args = [vpy, helper_script("worker.py"), fin, fout,
                 "-p", opts["preset"],
                 "--min-filler", f"{opts['minf']}",
@@ -540,6 +582,11 @@ class MainFrame(wx.Frame):
                 "--wariant-rpp", opts.get("wariant_rpp", "gotowy")]
         if opts.get("zapisz_wyciete"):
             args.append("--zapisz-wyciete")
+        # domyslnie chronimy muzyke; flaga workera WYLACZA ochrone
+        if not opts.get("omijaj_muzyke", True):
+            args.append("--bez-omijania-muzyki")
+        else:
+            args += ["--prog-muzyki", f"{opts.get('prog_muzyki', 0.50)}"]
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", env=env,
                                 creationflags=self._no_window())

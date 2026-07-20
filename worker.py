@@ -57,15 +57,20 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 from itertools import pairwise
 
 MODEL = "classla/wav2vecbert2-filledPause"
+# Model klasyfikacji audio (AudioSet) do wykrywania MUZYKI. Uzywany, by NIE wycinac
+# fillerow/pauz z fragmentow, w ktorych gra muzyka (spiew, jingle, podklad) - model
+# fillerow myli przeciagniete dzwieki muzyczne z "yyy". AST: 527 klas AudioSet,
+# multilabel (sigmoid). Interesuje nas prawdopodobienstwo klasy "Music".
+MUSIC_MODEL = "MIT/ast-finetuned-audioset-10-10-0.4593"
 # Sciezka do PLASKIEGO katalogu modelu (bootstrap pobiera go tam przez local_dir).
 # GUI ustawia CZYSCICIEL_MODEL_DIR; niezaleznie liczymy tez domyslna z LOCALAPPDATA
 # (odpornosc na blad sciezki w GUI - kandydatow probujemy po kolei).
-def _model_candidates():
+def _model_candidates(subdir="model", env_key="CZYSCICIEL_MODEL_DIR"):
     cands = []
-    md = os.environ.get("CZYSCICIEL_MODEL_DIR", "").strip()
+    md = os.environ.get(env_key, "").strip()
     if md: cands.append(md)
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    cands.append(os.path.join(base, "Czysciciel", "model"))
+    cands.append(os.path.join(base, "Czysciciel", subdir))
     return cands
 def _model_ref():
     """Zwraca (sciezka/repo, local_files_only). Preferuj lokalny plaski katalog;
@@ -74,10 +79,20 @@ def _model_ref():
         if os.path.exists(os.path.join(d, "preprocessor_config.json")):
             return d, True
     return MODEL, True
+def _music_model_ref():
+    """Jak _model_ref, ale dla modelu wykrywania muzyki (AST)."""
+    for d in _model_candidates(subdir="music_model", env_key="CZYSCICIEL_MUSIC_MODEL_DIR"):
+        if os.path.exists(os.path.join(d, "preprocessor_config.json")):
+            return d, True
+    return MUSIC_MODEL, True
 SR = 16000; CHUNK = 30.0; FS = 0.020
 CUT = 0.30                 # min dlugosc fillera
 KEEP = 0.50; TARGET = 0.45 # pauzy: do KEEP zostaw, dluzsze skroc do TARGET
 SAFE_MS = 20; XF_MS = 25
+# --- wykrywanie muzyki (AST/AudioSet) ---
+MUSIC_WIN = 4.0            # dlugosc okna analizy muzyki (s) - rozdzielczosc detekcji
+MUSIC_THRESH = 0.50        # prog prawdopodobienstwa klasy "Music" (sigmoid)
+MUSIC_PAD = 0.30           # margines rozszerzenia regionu muzyki (s) w kazda strone
 
 # --- komunikacja z GUI ---
 def emit(kind, payload):
@@ -96,9 +111,11 @@ def _ffmpeg_bin():
 # --- ciezkie importy dopiero gdy liczymy ---
 def _load_heavy():
     global np, torch, sf, librosa, pd, AutoFeatureExtractor, Wav2Vec2BertForAudioFrameClassification
+    global ASTForAudioClassification
     import numpy as np, torch, soundfile as sf, librosa
     import pandas as pd
     from transformers import AutoFeatureExtractor, Wav2Vec2BertForAudioFrameClassification
+    from transformers import ASTForAudioClassification
 
 # ---------- FILLERY ----------
 def f2i(frames, off, n_total):
@@ -163,6 +180,89 @@ def detect_pauses(y):
         ke = TARGET/2; ca = ta+ke; cb = tb-ke
         if cb-ca > 0.02: cuts.append((ca, cb))
     return cuts
+
+# ---------- MUZYKA (AST/AudioSet) ----------
+def detect_music(y_full):
+    """Zwraca liste (start_s, end_s) regionow, w ktorych gra MUZYKA (na osi oryginalu).
+    Analiza oknami MUSIC_WIN sekund modelem AST (AudioSet, multilabel). Dla kazdego
+    okna liczymy sigmoid logitow i bierzemy prawdopodobienstwo klasy 'Music'; okno z
+    p >= MUSIC_THRESH oznaczamy jako muzyke. Sasiednie muzyczne okna scalamy, region
+    rozszerzamy o MUSIC_PAD z kazdej strony (zeby zlapac naboki/wybrzmienia). Blad
+    ladowania modelu = brak muzyki (pusta lista) - lepiej wyczyscic niz pasc."""
+    try:
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        half = (dev == "cuda")
+        ref, lfo = _music_model_ref()
+        progress(72, "Ładowanie modelu wykrywania muzyki...")
+        log(f"model muzyki na {dev}{' fp16' if half else ''}")
+        fe = AutoFeatureExtractor.from_pretrained(ref, local_files_only=lfo)
+        model = ASTForAudioClassification.from_pretrained(
+            ref, torch_dtype=torch.float16 if half else torch.float32,
+            local_files_only=lfo).to(dev)
+        model.eval()
+        # indeks klasy "Music" z mapy etykiet modelu (id2label). Fallback: 137 (AudioSet).
+        music_idx = None
+        id2label = getattr(model.config, "id2label", {}) or {}
+        for k, v in id2label.items():
+            if str(v).strip().lower() == "music":
+                music_idx = int(k); break
+        if music_idx is None:
+            music_idx = 137
+            log("nie znaleziono etykiety 'Music' w modelu - uzywam indeksu 137")
+    except Exception as e:
+        log(f"model muzyki niedostepny ({e!r}) - pomijam wykrywanie muzyki")
+        return []
+    step = int(MUSIC_WIN * SR); n = len(y_full)
+    nwin = (n + step - 1) // step
+    flags = []  # (start_s, end_s, is_music)
+    for wi, ws in enumerate(range(0, n, step)):
+        ch = y_full[ws:ws+step]
+        if len(ch) < int(0.5*SR):
+            flags.append((ws/SR, (ws+len(ch))/SR, False)); continue
+        try:
+            with torch.no_grad():
+                inp = fe([ch], return_tensors="pt", sampling_rate=SR).to(dev)
+                if half: inp = {k: (v.half() if v.dtype == torch.float32 else v) for k, v in inp.items()}
+                logits = model(**inp).logits.float()[0]
+                p_music = torch.sigmoid(logits)[music_idx].item()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            with torch.no_grad():
+                inp = fe([ch], return_tensors="pt", sampling_rate=SR)
+                m_cpu = model.float().cpu()
+                logits = m_cpu(**inp).logits.float()[0]
+                p_music = torch.sigmoid(logits)[music_idx].item()
+                model.to(dev)
+                if half: model.half()
+        flags.append((ws/SR, (ws+len(ch))/SR, p_music >= MUSIC_THRESH))
+        progress(72 + 4*(wi+1)/max(nwin, 1), f"Wykrywanie muzyki: {wi+1}/{nwin}")
+    # scal sasiednie muzyczne okna w regiony + margines
+    regions = []
+    for (a, b, ismus) in flags:
+        if not ismus: continue
+        a = max(0.0, a - MUSIC_PAD); b = b + MUSIC_PAD
+        if regions and a <= regions[-1][1]:
+            regions[-1][1] = max(regions[-1][1], b)
+        else:
+            regions.append([a, b])
+    total_music = sum(b-a for a, b in regions)
+    log(f"muzyka: {len(regions)} region(ow), lacznie {total_music/60:.1f} min")
+    return [(a, b) for a, b in regions]
+
+def _in_music(a, b, music_regions):
+    """Czy odcinek [a,b] (s) NACHODZI na ktorykolwiek region muzyki."""
+    for (ma, mb) in music_regions:
+        if a < mb and b > ma:
+            return True
+    return False
+
+def filter_cuts_by_music(allc, music_regions):
+    """Usuwa z listy ciec te, ktore wpadaja w muzyke (zachowujemy muzyke nietknieta).
+    Zwraca (kept, removed_count)."""
+    if not music_regions:
+        return allc, 0
+    kept = [c for c in allc if not _in_music(c["a"], c["b"], music_regions)]
+    return kept, len(allc) - len(kept)
 
 # ---------- KEEP SEGMENTS (wspolne dla ciecia i eksportu RPP) ----------
 def compute_keeps(total_frames, sr, cuts):
@@ -504,7 +604,7 @@ def export_rpp_marked(rpp_path, source_file, keeps, merged, sr, src_delay=0):
 
 def main():
     import argparse
-    global CUT, KEEP, TARGET
+    global CUT, KEEP, TARGET, MUSIC_THRESH
     PRESETY = {
         "zachowawczy": (0.30, 0.70, 0.60),
         "umiarkowany": (0.30, 0.50, 0.45),
@@ -544,6 +644,13 @@ def main():
                          "(itemy WYTNIJ, ripple) / oba (domyslnie: gotowy)")
     ap.add_argument("--zapisz-wyciete", action="store_true",
                     help="zapisz tez osobny plik z tym, co zostalo wyciete (do odsluchu)")
+    # muzyka: domyslnie POMIJAMY fragmenty z muzyka (nie tniemy fillerow/pauz w muzyce).
+    # Flaga wylaczajaca dla zaawansowanych; GUI trzyma to jako domyslnie wlaczony checkbox.
+    ap.add_argument("--bez-omijania-muzyki", action="store_true",
+                    help="NIE omijaj muzyki - tnij fillery/pauzy w calym materiale (domyslnie muzyka jest chroniona)")
+    ap.add_argument("--prog-muzyki", type=float, default=MUSIC_THRESH,
+                    help=f"prog czulosci wykrywania muzyki 0..1 (domyslnie {MUSIC_THRESH}; "
+                         "wyzszy = chroni tylko wyrazna muzyke, tlo tnie; nizszy = chroni juz przy sladzie muzyki)")
     # zgodnosc wstecz:
     ap.add_argument("--bez-pauz", action="store_true", help="alias --tryb fillery")
     ap.add_argument("--rpp", action="store_true", help="alias --eksport oba")
@@ -565,6 +672,7 @@ def main():
 
         CUT, keep_p, target_p = a.min_filler, *PRESETY[a.preset][1:]
         KEEP, TARGET = keep_p, target_p
+        MUSIC_THRESH = min(1.0, max(0.0, a.prog_muzyki))
         ain = a.wejscie
         # wyjscie: uzyj podanego, ale wymus poprawne rozszerzenie wg formatu
         if a.wyjscie:
@@ -610,6 +718,25 @@ def main():
         allc = [{"a": aa, "b": bb, "dur": bb-aa, "typ": "filler"} for aa, bb in fillers] + \
                [{"a": aa, "b": bb, "dur": bb-aa, "typ": "pauza"} for aa, bb in pauses]
         allc.sort(key=lambda z: z["a"])
+
+        # 2b. MUZYKA: domyslnie chronimy fragmenty z muzyka - odrzucamy ciecia w muzyce
+        # (model fillerow myli spiew/instrumenty z "yyy"). Wylaczane --bez-omijania-muzyki.
+        omijaj_muzyke = not a.bez_omijania_muzyki
+        if omijaj_muzyke and allc:
+            log(f"ochrona muzyki: włączona (próg {MUSIC_THRESH:.2f})")
+            music = detect_music(y)
+            before = len(allc)
+            allc, removed = filter_cuts_by_music(allc, music)
+            if music:
+                log(f"muzyka chroniona: odrzucono {removed}/{before} cięć w muzyce")
+            # gdy prawie caly material to muzyka - ostrzez (bramka calego pliku)
+            if music:
+                total_music = sum(b-a for a, b in music)
+                if total_music >= 0.9 * (len(y)/SR):
+                    log("UWAGA: materiał to niemal w całości muzyka - nic nie wycinam")
+        elif not omijaj_muzyke:
+            log("omijanie muzyki WYŁĄCZONE - tnę w całym materiale")
+
         json.dump({"fillers": allc}, open(os.path.join(outdir, f"ciecia_{stem}.json"), "w"), indent=1)
 
         # 3. keep-segments (wspolne dla ciecia i RPP)
