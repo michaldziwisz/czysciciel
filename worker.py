@@ -25,6 +25,20 @@ Uzycie:
 """
 import os, sys, json, subprocess, time
 
+# Windows: dzieci (ffmpeg) BEZ wlasnego okna konsoli. GUI odpala worker z
+# CREATE_NO_WINDOW, ale flaga nie propaguje sie na wnuki - kazdy subprocess.run
+# ffmpeg bez niej migalby czarna konsola przy remuxie/eksporcie.
+if os.name == "nt":
+    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    _SI = subprocess.STARTUPINFO()
+    _SI.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    _SI.wShowWindow = 0  # SW_HIDE
+    def _win_kw():
+        return {"creationflags": _NO_WINDOW, "startupinfo": _SI}
+else:
+    def _win_kw():
+        return {}
+
 # UTF-8 na stdout (Windows konsola/pipe) - inaczej polskie znaki w logu sie sypia
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -243,7 +257,7 @@ def read_chapters(path, ff):
     tmp = path + ".ffmeta_in.txt"
     try:
         subprocess.run([ff, "-y", "-v", "error", "-i", path, "-f", "ffmetadata", tmp],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, **_win_kw())
         if not os.path.exists(tmp):
             return []
         with open(tmp, "r", encoding="utf-8", errors="replace") as fh:
@@ -545,7 +559,7 @@ def main():
         src_wav = os.path.join(outdir, stem + "_src.wav")
         log(f"remux wejścia do czystego WAV: {ain}")
         r = subprocess.run([ff, "-y", "-err_detect", "ignore_err", "-i", ain,
-                            "-c:a", "pcm_s16le", src_wav], capture_output=True, text=True)
+                            "-c:a", "pcm_s16le", src_wav], capture_output=True, text=True, **_win_kw())
         if not (os.path.exists(src_wav) and os.path.getsize(src_wav) > 1000000):
             log(f"BŁĄD remuxu, używam oryginału bezpośrednio. ffmpeg: {r.stderr[-300:]}")
             src_wav = ain
@@ -628,7 +642,7 @@ def main():
                 if cover_ok:
                     enc += ["-c:v", "copy", "-disposition:v", "attached_pic"]
                 enc.append(out_path)
-                r2 = subprocess.run(enc, capture_output=True, text=True)
+                r2 = subprocess.run(enc, capture_output=True, text=True, **_win_kw())
                 # fallback: gdyby przenoszenie tagow/okladki/rozdzialow zawiodlo, sprobuj bez nich
                 if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
                     log("kopiowanie tagów nie powiodło się - eksport bez tagów")
@@ -640,7 +654,7 @@ def main():
                     if a.kanaly == "mono": enc2 += ["-ac", "1"]
                     elif a.kanaly == "stereo": enc2 += ["-ac", "2"]
                     enc2.append(out_path)
-                    r2 = subprocess.run(enc2, capture_output=True, text=True)
+                    r2 = subprocess.run(enc2, capture_output=True, text=True, **_win_kw())
                     if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
                         raise RuntimeError("eksport audio nie powiódł się: " + r2.stderr[-300:])
 

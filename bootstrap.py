@@ -23,6 +23,21 @@ Protokol postepu (STDOUT, parsowany przez GUI):
 """
 import os, sys, json, subprocess, shutil, urllib.request, zipfile, tempfile, ssl, time
 
+# Windows: uruchamiaj procesy potomne BEZ wlasnego okna konsoli. GUI odpala
+# bootstrap z CREATE_NO_WINDOW, ale ta flaga NIE propaguje sie na WNUKI - kazdy
+# subprocess.run bez niej (uv.exe, python venv, nvidia-smi) dostaje swiezo
+# alokowana czarna konsole, ktora mignie testerowi w trakcie instalacji.
+if os.name == "nt":
+    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    _SI = subprocess.STARTUPINFO()
+    _SI.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    _SI.wShowWindow = 0  # SW_HIDE
+    def _win_kw():
+        return {"creationflags": _NO_WINDOW, "startupinfo": _SI}
+else:
+    def _win_kw():
+        return {}
+
 RUNTIME_VER = "3"
 
 # --- przypiete wersje (zgodne z dzialajacym cleaner/.venv) ---
@@ -74,7 +89,7 @@ def _has_nvidia():
     for cmd in ([smi] if os.path.exists(smi) else []) + [["nvidia-smi"]]:
         try:
             r = subprocess.run(cmd if isinstance(cmd, list) else [cmd],
-                               capture_output=True, text=True, timeout=15)
+                               capture_output=True, text=True, timeout=15, **_win_kw())
             if r.returncode == 0 and "NVIDIA" in (r.stdout or ""):
                 return True
         except Exception:
@@ -124,7 +139,7 @@ def _unzip_dll_neighbours(zip_path, dest_dir):
 
 def _run(cmd, desc, env=None):
     blog(f"$ {desc}")
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env, **_win_kw())
     if r.returncode != 0:
         tail = (r.stderr or r.stdout or "")[-800:]
         raise RuntimeError(f"{desc} nie powiodlo sie (kod {r.returncode}):\n{tail}")
@@ -177,7 +192,7 @@ def maybe_update_model(P, env):
             "    print('UPD_SKIP', repr(e)[:120]); sys.exit(0)\n"
         )
     try:
-        r = subprocess.run([P["vpy"], dl], capture_output=True, text=True, env=env, timeout=180)
+        r = subprocess.run([P["vpy"], dl], capture_output=True, text=True, env=env, timeout=180, **_win_kw())
         if "UPD_OK" in (r.stdout or ""):
             blog("model aktualny (lub pobrano nowsza wersje)")
         else:
