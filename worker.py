@@ -204,6 +204,151 @@ def write_removed(ain, merged, aout, sr, ch):
             fout.write(block); written += len(block)
     return written
 
+# ---------- ROZDZIALY (chaptery ID3/CHAP) ----------
+# Rozdzialy w pliku wejsciowym maja czasy na osi ORYGINALU. Po wycieciu fillerow/pauz
+# os wynikowa jest krotsza - a KLUCZOWE: przesuniecie NIE jest jednorodne. Sklada sie
+# z DWOCH skladnikow, ktore narastaja im dalej w material:
+#   1. suma dlugosci wszystkich WYCIETYCH fragmentow PRZED danym punktem,
+#   2. crossfade XF_MS (25ms) odejmowany na KAZDYM zlaczeniu keep-segmentow.
+# Punkt k-tego zachowanego segmentu ladduje w wyniku na: (suma dlugosci keepow<k) - k*XF.
+# To identyczna matematyka jak w export_rpp (item startuje xf przed koncem poprzedniego).
+# Dlatego 00:00:00 zostaje 00:00:00, ale kolejne znaczniki trzeba remapowac coraz mocniej.
+
+def _ffmeta_unescape(s):
+    out = []; i = 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i+1 < len(s):
+            out.append(s[i+1]); i += 2
+        else:
+            out.append(c); i += 1
+    return "".join(out)
+
+def _ffmeta_escape(s):
+    # ffmetadata: escape = ; # \ i znak nowej linii
+    res = []
+    for c in s:
+        if c in "=;#\\":
+            res.append("\\" + c)
+        elif c == "\n":
+            res.append("\\\n")
+        else:
+            res.append(c)
+    return "".join(res)
+
+def read_chapters(path, ff):
+    """Czyta rozdzialy z pliku audio przez 'ffmpeg -f ffmetadata' (bootstrap nie
+    dostarcza ffprobe). Zwraca liste (start_s, end_s, title) na osi ORYGINALU
+    lub [] gdy brak rozdzialow / blad."""
+    tmp = path + ".ffmeta_in.txt"
+    try:
+        subprocess.run([ff, "-y", "-v", "error", "-i", path, "-f", "ffmetadata", tmp],
+                       capture_output=True, text=True)
+        if not os.path.exists(tmp):
+            return []
+        with open(tmp, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except Exception as e:
+        log(f"nie udalo sie odczytac rozdzialow: {e!r}")
+        return []
+    finally:
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except Exception:
+            pass
+    chapters = []; cur = None; tb = (1, 1000)
+    for ln in lines:
+        if ln.strip().upper() == "[CHAPTER]":
+            if cur is not None: chapters.append(cur)
+            cur = {"tb": (1, 1000), "start": 0, "end": 0, "title": ""}
+            continue
+        if cur is None:
+            continue
+        if ln.startswith("[") and ln.strip().endswith("]"):
+            chapters.append(cur); cur = None; continue
+        if "=" not in ln:
+            continue
+        key, val = ln.split("=", 1)
+        key = key.strip().upper()
+        if key == "TIMEBASE":
+            try:
+                num, den = val.strip().split("/"); cur["tb"] = (int(num), int(den))
+            except Exception:
+                cur["tb"] = (1, 1000)
+        elif key == "START":
+            try: cur["start"] = int(val.strip())
+            except Exception: cur["start"] = 0
+        elif key == "END":
+            try: cur["end"] = int(val.strip())
+            except Exception: cur["end"] = 0
+        elif key.lower() == "title":
+            cur["title"] = _ffmeta_unescape(val)
+    if cur is not None:
+        chapters.append(cur)
+    out = []
+    for c in chapters:
+        num, den = c["tb"]; den = den or 1000
+        out.append((c["start"]*num/den, c["end"]*num/den, c["title"]))
+    return out
+
+def remap_sample(p, keeps, xf):
+    """Mapuje probke p z osi ORYGINALU na probke osi WYNIKU (po wycieciu + crossfade).
+    Punkt wpadajacy w wyciety fragment przyciaga sie do poczatku nastepnego
+    zachowanego segmentu. Uwzglednia narastajacy dryf -k*xf."""
+    cum = 0
+    for k, (s, e) in enumerate(keeps):
+        base = cum - k*xf
+        if p < s:
+            return max(0, base)
+        if p < e:
+            return max(0, base + (p - s))
+        cum += (e - s)
+    total = cum - max(0, len(keeps)-1)*xf
+    return max(0, total)
+
+def _fmt_ts(seconds):
+    if seconds < 0: seconds = 0
+    total_ms = int(round(seconds * 1000))
+    h = total_ms // 3600000; total_ms %= 3600000
+    m = total_ms // 60000; total_ms %= 60000
+    s = total_ms // 1000
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def remap_chapters(chapters, keeps, sr, xf):
+    """Zwraca liste (new_start_s, new_end_s, title) na osi WYNIKU."""
+    out = []
+    for st, en, title in chapters:
+        ns = remap_sample(int(round(st*sr)), keeps, xf) / sr
+        ne = remap_sample(int(round(en*sr)), keeps, xf) / sr
+        out.append((ns, ne, title))
+    return out
+
+def write_chapters_txt(txt_path, chapters):
+    """Sidecar 'chapters.txt': jedna linia na rozdzial w postaci 'etykieta timestamp'."""
+    with open(txt_path, "w", encoding="utf-8") as f:
+        for st, en, title in chapters:
+            label = (title or "").strip() or "Rozdział"
+            f.write(f"{label} {_fmt_ts(st)}\n")
+    return txt_path
+
+def write_chapters_ffmeta(meta_path, chapters, total_out_s):
+    """Buduje plik ffmetadata z SAMYMI rozdzialami (skorygowane czasy) do wstrzykniecia
+    w plik wynikowy przez '-map_chapters'. END domykamy do dlugosci wyniku."""
+    with open(meta_path, "w", encoding="utf-8") as f:
+        f.write(";FFMETADATA1\n")
+        n = len(chapters)
+        for i, (st, en, title) in enumerate(chapters):
+            start_ms = int(round(st * 1000))
+            # END: nastepny start, a dla ostatniego - koniec materialu
+            end_ms = int(round((chapters[i+1][0] if i+1 < n else total_out_s) * 1000))
+            if end_ms <= start_ms: end_ms = start_ms + 1
+            f.write("[CHAPTER]\n")
+            f.write("TIMEBASE=1/1000\n")
+            f.write(f"START={start_ms}\n")
+            f.write(f"END={end_ms}\n")
+            f.write(f"title={_ffmeta_escape((title or '').strip())}\n")
+    return meta_path
+
 # ---------- EKSPORT PROJEKTU REAPERA (.RPP) ----------
 def _rpp_guid():
     import uuid
@@ -427,21 +572,52 @@ def main():
         info = sf.info(ain_proc); sr = info.samplerate; ch = info.channels
         keeps, merged = compute_keeps(info.frames, sr, [(c["a"], c["b"]) for c in allc])
 
+        # 3b. ROZDZIALY: przeczytaj z oryginalu, skoryguj czasy wzgledem ciec.
+        # Dlugosc wyniku (w probkach): suma keepow minus crossfade na kazdym zlaczeniu.
+        xf = int(XF_MS/1000*sr)
+        out_frames = sum(e-s for s, e in keeps) - max(0, len(keeps)-1)*xf
+        out_total_s = max(0, out_frames)/sr
+        chapters_meta = None
+        try:
+            src_chapters = read_chapters(ain, ff)
+        except Exception as e:
+            log(f"rozdzialy: pominieto ({e!r})"); src_chapters = []
+        if src_chapters:
+            new_chapters = remap_chapters(src_chapters, keeps, sr, xf)
+            # sidecar '<nazwa pliku wyjsciowego> chapters.txt' - etykieta timestamp / linia
+            txt_path = os.path.splitext(aout)[0] + " chapters.txt"
+            write_chapters_txt(txt_path, new_chapters)
+            log(f"rozdzialy: {len(new_chapters)} -> {txt_path}")
+            # ffmetadata do wstrzykniecia skorygowanych rozdzialow w plik wynikowy
+            chapters_meta = os.path.join(outdir, stem + "_chapters.ffmeta.txt")
+            write_chapters_ffmeta(chapters_meta, new_chapters, out_total_s)
+        else:
+            log("rozdzialy: brak w pliku wejsciowym")
+
         # 4. eksport AUDIO (jesli wybrany)
         if eksport in ("audio", "oba"):
             # formaty (klucze), ktore sensownie przenosza okladke (attached_pic)
             cover_ok = a.format in ("mp3", "aac", "alac", "flac")
             # wspolny enkoder WAV -> docelowy format (DRY: czysty i wyciete)
             # tagi (tytul/wykonawca/album...) i okladke kopiujemy z ORYGINALU wejscia
-            def encode(wav_in, out_path, etap):
+            def encode(wav_in, out_path, etap, chap_meta=None):
                 progress(90, etap)
                 log(etap)
                 # 2 wejscia: [0]=czysty WAV (audio), [1]=oryginal (zrodlo tagow/okladki)
+                # opcjonalnie [2]=ffmetadata ze SKORYGOWANYMI rozdzialami
                 enc = [ff, "-y", "-i", wav_in, "-i", ain]
+                if chap_meta:
+                    enc += ["-i", chap_meta]
                 enc += ["-map", "0:a"]
                 if cover_ok:
                     enc += ["-map", "1:v?"]          # okladka jesli istnieje (opcjonalnie)
                 enc += ["-map_metadata", "1"]        # tagi tekstowe z oryginalu
+                # rozdzialy: wstrzyknij skorygowane z wejscia 2, inaczej NIE kopiuj
+                # starych (bledne czasy z oryginalu) - domyslnie ffmpeg by je przeniosl
+                if chap_meta:
+                    enc += ["-map_chapters", "2"]
+                else:
+                    enc += ["-map_chapters", "-1"]
                 enc += ["-c:a", kodek]
                 if stratny:
                     enc += ["-b:a", f"{a.bitrate}k"]
@@ -453,10 +629,13 @@ def main():
                     enc += ["-c:v", "copy", "-disposition:v", "attached_pic"]
                 enc.append(out_path)
                 r2 = subprocess.run(enc, capture_output=True, text=True)
-                # fallback: gdyby przenoszenie tagow/okladki zawiodlo, sprobuj bez nich
+                # fallback: gdyby przenoszenie tagow/okladki/rozdzialow zawiodlo, sprobuj bez nich
                 if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
                     log("kopiowanie tagów nie powiodło się - eksport bez tagów")
-                    enc2 = [ff, "-y", "-i", wav_in, "-c:a", kodek]
+                    enc2 = [ff, "-y", "-i", wav_in]
+                    if chap_meta:
+                        enc2 += ["-i", chap_meta, "-map", "0:a", "-map_chapters", "1"]
+                    enc2 += ["-c:a", kodek]
                     if stratny: enc2 += ["-b:a", f"{a.bitrate}k"]
                     if a.kanaly == "mono": enc2 += ["-ac", "1"]
                     elif a.kanaly == "stereo": enc2 += ["-ac", "2"]
@@ -471,9 +650,12 @@ def main():
             written = cut_stream(ain_proc, keeps, wav_out, sr, ch)
             di = info.frames/sr; do = written/sr
             log(f"wycięte: {di:.0f}s -> {do:.0f}s (usunięto {di-do:.0f}s = {(di-do)/60:.1f}min, {len(merged)} cięć)")
-            encode(wav_out, aout, f"Eksport {a.format.upper()}...")
+            encode(wav_out, aout, f"Eksport {a.format.upper()}...", chap_meta=chapters_meta)
             if not a.zostaw_wav and os.path.exists(wav_out):
                 os.remove(wav_out)
+            if chapters_meta and os.path.exists(chapters_meta):
+                try: os.remove(chapters_meta)
+                except Exception: pass
 
             # 4b. opcjonalnie: osobny plik z tym, co WYCIETE (do odsluchu/kontroli)
             if a.zapisz_wyciete and merged:
@@ -506,6 +688,9 @@ def main():
 
         if src_wav != ain and os.path.exists(src_wav):
             os.remove(src_wav)
+        if chapters_meta and os.path.exists(chapters_meta):
+            try: os.remove(chapters_meta)
+            except Exception: pass
 
         progress(100, "Gotowe")
         wynik = aout if eksport in ("audio", "oba") else rpp_path
