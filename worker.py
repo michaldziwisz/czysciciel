@@ -364,6 +364,30 @@ def write_chapters_ffmeta(meta_path, chapters, total_out_s):
     return meta_path
 
 # ---------- EKSPORT PROJEKTU REAPERA (.RPP) ----------
+def mp3_encoder_delay(ff, path):
+    """Zwraca encoder delay (probki) jaki dekoder USUWA z przodu MP3 (LAME/gapless).
+    KLUCZOWE dla RPP: ffmpeg dekoduje MP3 gapless (nasze ciecia liczone bez tych
+    probek), ale Reaper importujac MP3 tych probek NIE usuwa - cala tresc jest
+    przesunieta o delay do tylu, wiec SOFFS trafialby wczesniej niz trzeba
+    (objaw: 'kazde ciecie o ~0.1s za wczesnie'). Kompensujemy dodajac delay do SOFFS.
+    Odczyt najpewniejszy z samego ffmpega (bootstrap nie dostarcza ffprobe):
+    'ffmpeg -v debug' wypisuje na stderr 'demuxer injecting skip <N> / discard'.
+    Zwraca 0 gdy nie MP3 / nie udalo sie odczytac (wtedy zero kompensacji)."""
+    if os.path.splitext(path)[1].lower() != ".mp3":
+        return 0
+    try:
+        r = subprocess.run([ff, "-v", "debug", "-i", path, "-t", "0.1", "-f", "null", "-"],
+                           capture_output=True, text=True, **_win_kw())
+        import re
+        # preferuj 'demuxer injecting skip N', fallback 'skip N / discard'
+        m = re.search(r"injecting skip\s+(\d+)", r.stderr or "")
+        if not m:
+            m = re.search(r"skip\s+(\d+)\s*/\s*discard", r.stderr or "")
+        return int(m.group(1)) if m else 0
+    except Exception as e:
+        log(f"nie udalo sie odczytac encoder-delay MP3 ({e!r}) - bez kompensacji")
+        return 0
+
 def _rpp_guid():
     import uuid
     return "{" + str(uuid.uuid4()).upper() + "}"
@@ -412,20 +436,23 @@ def _src_info(source_file):
     stype = {".mp3": "MP3", ".flac": "FLAC", ".ogg": "VORBIS", ".opus": "VORBIS"}.get(ext, "WAVE")
     return src, stype
 
-def export_rpp(rpp_path, source_file, keeps, merged, sr):
+def export_rpp(rpp_path, source_file, keeps, merged, sr, src_delay=0):
     """WARIANT GOTOWY: fillery/pauzy JUZ wyciete, segmenty dosuniete z CROSSFADEM
     na zlaczeniach (te same 25ms co plik audio z ffmpega - brzmi tak samo plynnie).
     Kolejne itemy NAKLADAJA sie o XF_MS i maja fade in/out => crossfade. Odwolanie
-    do ORYGINALU przez SOFFS, wiec kazde ciecie mozna cofnac/rozciagnac."""
+    do ORYGINALU przez SOFFS, wiec kazde ciecie mozna cofnac/rozciagnac.
+    src_delay: encoder-delay zrodla (probki) dodawany do SOFFS - Reaper NIE usuwa
+    delay MP3 (ffmpeg usuwa), wiec bez tego cala tresc bylaby o delay za wczesnie."""
     src, stype = _src_info(source_file)
     def secs(fr): return fr/sr
+    def soffs(fr): return (fr + src_delay)/sr   # kompensacja encoder-delay zrodla
     xf = XF_MS / 1000.0
     items = []; pos = 0.0; n = len(keeps)
     for idx, (s, e) in enumerate(keeps):
         length = secs(e - s)
         fin = xf if idx > 0 else 0.0            # crossfade z poprzednim
         fout = xf if idx < n-1 else 0.0         # crossfade z nastepnym
-        items.append(_rpp_item(pos, length, secs(s), "segment", src, stype, fin, fout))
+        items.append(_rpp_item(pos, length, soffs(s), "segment", src, stype, fin, fout))
         # nastepny item startuje xf PRZED koncem tego => nalozenie = crossfade
         pos += length - (xf if idx < n-1 else 0.0)
     markers = []; mp = 0.0; idx = 1
@@ -441,15 +468,18 @@ def export_rpp(rpp_path, source_file, keeps, merged, sr):
     log(f"projekt Reapera (gotowy): {rpp_path} (wycięte {cut_total/60:.1f} min, {len(keeps)} segmentów)")
     return rpp_path
 
-def export_rpp_marked(rpp_path, source_file, keeps, merged, sr):
+def export_rpp_marked(rpp_path, source_file, keeps, merged, sr, src_delay=0):
     """WARIANT DO PRZEJRZENIA: caly material na osi w ORYGINALNYM ukladzie
     (nic nie dosuniete), rozbity na itemy. Fragmenty do wyciecia to osobne
     itemy nazwane 'WYTNIJ N' (czytnik ekranu je odczyta), zachowane to 'zostaw'.
     Projekt ma wlaczony RIPPLE ALL - skasowanie itemu 'WYTNIJ' automatycznie
     dosuwa reszte. Jesli uznasz, ze czegos wyciac nie warto - po prostu nie
-    kasujesz tego itemu."""
+    kasujesz tego itemu.
+    src_delay: encoder-delay MP3 dodawany do SOFFS (Reaper nie usuwa delay ktory
+    ffmpeg usuwal) - inaczej tresc kazdego itemu bylaby o delay za wczesnie."""
     src, stype = _src_info(source_file)
     def secs(fr): return fr/sr
+    def soffs(fr): return (fr + src_delay)/sr
     # zbuduj pelna sekwencje segmentow (keep + cut) posortowana po czasie
     segs = [("keep", s, e) for (s, e) in keeps] + [("cut", s, e) for (s, e) in merged]
     segs.sort(key=lambda z: z[1])
@@ -463,8 +493,8 @@ def export_rpp_marked(rpp_path, source_file, keeps, merged, sr):
             markers.append(f'  MARKER {cut_no} {secs(s):.6f} "WYTNIJ {cut_no}" 0 0 1 R {_rpp_guid()}')
         else:
             name = "zostaw"
-        # POSITION = oryginalny czas (bez dosuwania), SOFFS = ten sam = oryginal 1:1
-        items.append(_rpp_item(secs(s), secs(e-s), secs(s), name, src, stype))
+        # POSITION = oryginalny czas (bez dosuwania), SOFFS = ten sam + kompensacja delay
+        items.append(_rpp_item(secs(s), secs(e-s), soffs(s), name, src, stype))
     content = _rpp_document("Czysciciel - do przejrzenia (skasuj itemy WYTNIJ)",
                             items, markers, sr, ripple=2)  # 2 = ripple all tracks
     with open(rpp_path, "w", encoding="utf-8") as f:
@@ -687,16 +717,34 @@ def main():
             elif a.zapisz_wyciete:
                 log("nic nie wycięto - plik z wyciętymi fragmentami pominięty")
 
-        # 5. eksport REAPER (jesli wybrany) - odwoluje sie do ORYGINALU wejscia
+        # 5. eksport REAPER (jesli wybrany)
         rpp_path = None
         if eksport in ("reaper", "oba"):
             progress(95, "Eksport projektu Reapera...")
+            # ZRODLO RPP = bezstratny FLAC zdekodowany z DOKLADNIE tego gapless-PCM,
+            # na ktorym liczylismy ciecia (ain_proc). Dzieki temu SOFFS trafia 1:1 w te
+            # sama tresc co czysty plik. MP3 jako zrodlo dawal rozjazd: Reaper seekuje/
+            # dekoduje MP3 inaczej niz nasz ffmpeg-gapless (zmienny offset ~0.1-0.2s,
+            # nie do skompensowania staly delay). FLAC nie ma encoder-delay -> SOFFS=probka/sr.
+            rpp_src = os.path.join(outdir, stem + "_zrodlo.flac")
+            fr = subprocess.run([ff, "-y", "-i", ain_proc, "-c:a", "flac", rpp_src],
+                                capture_output=True, text=True, **_win_kw())
+            if os.path.exists(rpp_src) and os.path.getsize(rpp_src) > 1000:
+                src_delay = 0  # FLAC bez delay - zadnej korekty
+                log(f"zrodlo projektu Reapera: bezstratny FLAC {os.path.basename(rpp_src)} "
+                    f"({os.path.getsize(rpp_src)//(1024*1024)} MB, ciecia trafiaja 1:1)")
+            else:
+                # awaryjnie: wskaz oryginal (MP3) z kompensacja encoder-delay
+                rpp_src = ain
+                src_delay = mp3_encoder_delay(ff, ain)
+                log(f"FLAC zrodlowy nie powstal ({fr.stderr[-200:]}) - RPP wskazuje oryginal "
+                    f"z kompensacja delay +{src_delay} probek (moze nie byc 1:1)")
             if a.wariant_rpp in ("gotowy", "oba"):
                 rpp_path = os.path.join(outdir, stem + ".RPP")
-                export_rpp(rpp_path, ain, keeps, merged, sr)
+                export_rpp(rpp_path, rpp_src, keeps, merged, sr, src_delay=src_delay)
             if a.wariant_rpp in ("przejrzenie", "oba"):
                 rpp_m = os.path.join(outdir, stem + "_do_przejrzenia.RPP")
-                export_rpp_marked(rpp_m, ain, keeps, merged, sr)
+                export_rpp_marked(rpp_m, rpp_src, keeps, merged, sr, src_delay=src_delay)
                 if rpp_path is None:
                     rpp_path = rpp_m
 
