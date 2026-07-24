@@ -102,6 +102,7 @@ class MainFrame(wx.Frame):
         self.runtime_ffmpeg = None
         self._set_icon()
         self._build_ui()
+        self._load_settings()                    # przywroc ustawienia z poprzedniej sesji
         self.Centre()
         self.Show()
 
@@ -453,6 +454,75 @@ class MainFrame(wx.Frame):
             "Środowisko instaluje się raz przy pierwszym uruchomieniu.",
             "O programie", wx.OK | wx.ICON_INFORMATION)
 
+    # ---------------- persystencja ustawien ----------------
+    def _settings_path(self):
+        return os.path.join(runtime_root(), "settings.json")
+
+    def _collect_settings(self):
+        """Ustawienia uzytkownika do zapamietania miedzy sesjami. NIE zapisujemy listy
+        plikow (celowo - za kazdym razem inna)."""
+        return {
+            "preset": self.ch_preset.GetSelection(),
+            "minfiller": self.sc_minfiller.GetValue(),
+            "tryb": self.rb_tryb.GetSelection(),
+            "eksport": self.rb_eksport.GetSelection(),
+            "format": self.ch_format.GetSelection(),
+            "kanaly": self.ch_kanaly.GetSelection(),
+            "bitrate": self.ch_bitrate.GetSelection(),
+            "wariant": self.rb_wariant.GetSelection(),
+            "zapisz_wyciete": self.cb_wyciete.GetValue(),
+            "omijaj_muzyke": self.cb_muzyka.GetValue(),
+            "prog_muzyki": self.sl_muzyka.GetValue(),
+            "workers": self.sc_workers.GetValue(),
+            "dokladny": self.cb_dokladny.GetValue(),
+            "outdir": self.txt_out.GetValue().strip(),
+        }
+
+    def _save_settings(self):
+        try:
+            import json
+            os.makedirs(runtime_root(), exist_ok=True)
+            with open(self._settings_path(), "w", encoding="utf-8") as f:
+                json.dump(self._collect_settings(), f, ensure_ascii=False, indent=1)
+        except Exception:
+            pass   # zapis ustawien nie moze nigdy wywalic aplikacji
+
+    def _load_settings(self):
+        """Przywraca ustawienia z poprzedniej sesji. Uszkodzony/niepelny plik jest
+        ignorowany po cichu - kazdy klucz osobno, wiec brak jednego nie psuje reszty."""
+        try:
+            import json
+            with open(self._settings_path(), encoding="utf-8") as f:
+                s = json.load(f)
+        except Exception:
+            return
+        def _sel(ctrl, key, n):
+            v = s.get(key)
+            if isinstance(v, int) and 0 <= v < n: ctrl.SetSelection(v)
+        def _val(ctrl, key, typ):
+            v = s.get(key)
+            if isinstance(v, typ): ctrl.SetValue(v)
+        _sel(self.ch_preset, "preset", len(PRESETY))
+        _sel(self.rb_tryb, "tryb", len(TRYBY))
+        _sel(self.rb_eksport, "eksport", len(EKSPORTY))
+        _sel(self.ch_format, "format", len(FORMATY_OUT))
+        _sel(self.ch_kanaly, "kanaly", 3)
+        _sel(self.ch_bitrate, "bitrate", len(BITRATE_LISTA))
+        _sel(self.rb_wariant, "wariant", len(WARIANTY_RPP))
+        _val(self.sc_minfiller, "minfiller", (int, float))
+        _val(self.cb_wyciete, "zapisz_wyciete", bool)
+        _val(self.cb_muzyka, "omijaj_muzyke", bool)
+        _val(self.sl_muzyka, "prog_muzyki", int)
+        _val(self.sc_workers, "workers", int)
+        _val(self.cb_dokladny, "dokladny", bool)
+        outdir = s.get("outdir")
+        if isinstance(outdir, str) and outdir:
+            self.txt_out.SetValue(outdir)
+        # odswiez stany zalezne (bitrate wg formatu, widocznosc RPP, suwak wg muzyki)
+        self.on_format_change(None)
+        self.on_eksport_change(None)
+        self.on_muzyka_toggle(None)
+
     # ---------------- uruchomienie ----------------
     def _set_running(self, running):
         for b in (self.btn_start, self.btn_add, self.btn_addfolder, self.btn_del,
@@ -744,6 +814,7 @@ class MainFrame(wx.Frame):
                           APP_TITLE, wx.OK | wx.ICON_ERROR)
 
     def on_close(self, evt):
+        self._save_settings()
         self.stop_flag.set()
         self._proc_kill()
         evt.Skip()
