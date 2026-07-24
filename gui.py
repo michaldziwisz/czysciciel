@@ -97,6 +97,7 @@ class MainFrame(wx.Frame):
                          size=(760, 640))
         self.worker_thread = None
         self.stop_flag = threading.Event()
+        self._procs = set()             # aktywne procesy worker.py (kilka w trybie rownoleglym)
         self.runtime_python = None
         self.runtime_ffmpeg = None
         self._set_icon()
@@ -259,6 +260,29 @@ class MainFrame(wx.Frame):
         self.btn_out.SetName("Wybierz folder wyjściowy")
         r3.Add(self.btn_out, 0)
         root.Add(r3, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # --- liczba plikow przetwarzanych rownolegle (tryb wsadowy) ---
+        # W tle: gdy jeden plik jest na GPU (detekcja), inny moze rownolegle konczyc
+        # na CPU (enkode/ciecie) - karta obsluguje 1 plik naraz (zamek GPU w worker).
+        # Wiecej = szybszy wsad, ale wiecej RAM/dysku (kazdy plik trzyma ~2GB WAV).
+        rpar = wx.BoxSizer(wx.HORIZONTAL)
+        lbl_par = wx.StaticText(panel, label="Przetwarzaj &równolegle plików:")
+        rpar.Add(lbl_par, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.sc_workers = wx.SpinCtrl(panel, min=1, max=4, initial=2)
+        self.sc_workers.SetName("Liczba plików przetwarzanych równolegle. Domyślnie 2. "
+                                "Karta graficzna obsługuje jeden plik naraz, reszta czeka na nią.")
+        rpar.Add(self.sc_workers, 0, wx.ALIGN_CENTER_VERTICAL)
+        root.Add(rpar, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # --- tryb dokladny (weryfikacja do oporu) ---
+        # Domyslnie worker robi kilka rund domykajacych (do ~0.3s przyrostu). Tryb
+        # dokladny iteruje az NIC nie zostanie do wyciecia - kosztem czasu.
+        self.cb_dokladny = wx.CheckBox(panel,
+            label="Tryb do&kładny (weryfikuj do oporu — może wydłużyć przetwarzanie)")
+        self.cb_dokladny.SetName("Tryb dokładny. Powtarza weryfikację aż nic nie zostanie "
+                                 "do wycięcia. Daje najczystszy wynik, ale może znacznie "
+                                 "wydłużyć przetwarzanie, zwłaszcza długich nagrań.")
+        root.Add(self.cb_dokladny, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         # --- start/stop ---
         r4 = wx.BoxSizer(wx.HORIZONTAL)
@@ -435,7 +459,7 @@ class MainFrame(wx.Frame):
                   self.btn_clear, self.btn_out, self.ch_preset, self.sc_minfiller,
                   self.rb_tryb, self.rb_eksport, self.ch_format, self.ch_kanaly,
                   self.ch_bitrate, self.cb_wyciete, self.cb_muzyka, self.sl_muzyka,
-                  self.rb_wariant):
+                  self.rb_wariant, self.sc_workers, self.cb_dokladny):
             b.Enable(not running)
         if not running:
             self.on_format_change(None)   # przywroc poprawny stan bitrate
@@ -464,10 +488,13 @@ class MainFrame(wx.Frame):
         prog_muzyki = 1.0 - self.sl_muzyka.GetValue() / 100.0
         wariant_rpp = WARIANTY_RPP[self.rb_wariant.GetSelection()][0]
         outdir = self.txt_out.GetValue().strip() or None
+        workers = self.sc_workers.GetValue()
+        dokladny = self.cb_dokladny.GetValue()
         opts = dict(preset=preset, minf=minf, tryb=tryb, eksport=eksport,
                     fmt=fmt, bitrate=bitrate, kanaly=kanaly, outdir=outdir,
                     zapisz_wyciete=zapisz_wyciete, wariant_rpp=wariant_rpp,
-                    omijaj_muzyke=omijaj_muzyke, prog_muzyki=prog_muzyki)
+                    omijaj_muzyke=omijaj_muzyke, prog_muzyki=prog_muzyki, workers=workers,
+                    dokladny=dokladny)
         self.stop_flag.clear()
         self._set_running(True)
         self.gauge.SetValue(0)
@@ -481,15 +508,17 @@ class MainFrame(wx.Frame):
 
     def on_stop(self, evt):
         self.stop_flag.set()
-        self.append_log("Zatrzymywanie po bieżącym pliku...")
+        self.append_log("Zatrzymywanie — przerywam bieżące pliki...")
         self._proc_kill()
 
-    _cur_proc = None
     def _proc_kill(self):
-        p = self._cur_proc
-        if p and p.poll() is None:
-            try: p.terminate()
+        """Ubija WSZYSTKIE aktywne procesy worker.py (tryb rownolegly). Zamek GPU
+        zwalnia sie sam gdy proces ginie (blokada plikowa OS)."""
+        for p in list(self._procs):
+            try:
+                if p.poll() is None: p.terminate()
             except Exception: pass
+
 
     # ---- watek roboczy ----
     def _run_all(self, files, opts):
@@ -506,27 +535,45 @@ class MainFrame(wx.Frame):
                        "wma": "wma", "ac3": "ac3", "flac": "flac", "alac": "m4a", "wav": "wav"}
             ext = fmt_ext.get(opts["fmt"], "mp3")
             audio_out = opts["eksport"] in ("audio", "oba")
-            n = len(files); ok = 0
-            for idx, f in enumerate(files):
-                if self.stop_flag.is_set(): break
+            n = len(files); workers = max(1, min(int(opts.get("workers", 2)), n))
+
+            # stan wspoldzielony przez rownolegle workery (aktualizacja statusu dla NVDA)
+            self._n_total = n
+            self._slots = {}          # etykieta pliku -> ostatni komunikat etapu
+            self._done_cnt = 0
+            def process_one(idx, f):
+                if self.stop_flag.is_set():
+                    return None
                 base = os.path.basename(f); stem = os.path.splitext(base)[0]
                 od = opts["outdir"] or os.path.dirname(f)
                 os.makedirs(od, exist_ok=True)
                 out = os.path.join(od, stem + "_czysty." + ext)
-                wx.CallAfter(self.append_log, f"--- [{idx+1}/{n}] {base} ---")
-                wx.CallAfter(self.set_status, f"[{idx+1}/{n}] {base}")
-                rc = self._run_worker(vpy, ff, f, out, opts)
-                # weryfikacja wyniku: audio -> plik audio; sam reaper -> plik .RPP
+                label = f"[{idx+1}/{n}] {base}"
+                tag = f"[{idx+1}/{n}]"
+                wx.CallAfter(self.append_log, f"{tag} start: {base}")
+                rc = self._run_worker(vpy, ff, f, out, opts, label)
                 if audio_out:
                     good = rc == 0 and os.path.exists(out) and os.path.getsize(out) > 50000
                 else:
                     rpp = os.path.join(od, stem + ".RPP")
                     good = rc == 0 and os.path.exists(rpp) and os.path.getsize(rpp) > 100
-                if good:
-                    ok += 1
-                    wx.CallAfter(self.append_log, f"OK: {base}")
-                else:
-                    wx.CallAfter(self.append_log, f"BŁĄD przy: {base}")
+                wx.CallAfter(self._file_done, tag, base, good, label)
+                return good
+
+            ok = 0
+            if workers == 1:
+                for idx, f in enumerate(files):
+                    if self.stop_flag.is_set(): break
+                    if process_one(idx, f): ok += 1
+            else:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                wx.CallAfter(self.append_log,
+                             f"Tryb równoległy: {workers} pliki naraz "
+                             f"(karta obsługuje jeden na raz, reszta czeka).")
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = {ex.submit(process_one, idx, f): idx for idx, f in enumerate(files)}
+                    for fut in as_completed(futs):
+                        if fut.result(): ok += 1
             wx.CallAfter(self.append_log, f"Zakończono. Sukces: {ok}/{n}")
             wx.CallAfter(self._done, True, ok, n)
         except Exception as e:
@@ -536,6 +583,23 @@ class MainFrame(wx.Frame):
                 wx.CallAfter(self.append_log, "  " + ln)
             wx.CallAfter(self._done, False, 0, 0)
 
+    def _file_done(self, tag, base, good, label):
+        """Wpis koncowy pliku + aktualizacja licznika/statusu (glowny watek)."""
+        self.append_log(f"{tag} {'OK' if good else 'BŁĄD'}: {base}")
+        self._done_cnt = getattr(self, "_done_cnt", 0) + 1
+        self._slots.pop(label, None)
+        self._render_status()
+
+    def _render_status(self):
+        """Status zbiorczy dla czytnika: ile gotowe + co aktualnie w toku."""
+        n = getattr(self, "_n_total", 0)
+        done = getattr(self, "_done_cnt", 0)
+        wtoku = "; ".join(f"{lab.split(']')[0]}]: {msg}" for lab, msg in self._slots.items())
+        s = f"Gotowe {done}/{n}." + (f" W toku — {wtoku}" if wtoku else "")
+        self.set_status(s)
+        if n:
+            self.gauge.SetValue(max(0, min(100, int(done * 100 / n))))
+
     def _ensure_runtime(self):
         """Odpala bootstrap.py minimalnym Pythonem (frozen: sys.executable z flaga)."""
         cmd = self._python_for_helper(helper_script("bootstrap.py"))
@@ -543,7 +607,7 @@ class MainFrame(wx.Frame):
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace",
                                 creationflags=self._no_window())
-        self._cur_proc = proc
+        self._procs.add(proc)           # rejestr do ubijania (bootstrap tez reaguje na STOP)
         for line in proc.stdout:
             line = line.rstrip("\n")
             if line.startswith("BOOT|"):
@@ -556,12 +620,14 @@ class MainFrame(wx.Frame):
             elif line.startswith("BOOTERR|"):
                 wx.CallAfter(self.append_log, "BŁĄD instalacji: " + line[8:])
         proc.wait()
+        self._procs.discard(proc)
         if proc.returncode != 0 or not vpy:
             wx.CallAfter(self.append_log, "Nie udało się przygotować środowiska.")
             return None, None
         return vpy, ff
 
-    def _run_worker(self, vpy, ff, fin, fout, opts):
+    def _run_worker(self, vpy, ff, fin, fout, opts, label):
+        tag = label.split("]")[0] + "]" if "]" in label else label   # np. "[7/53]"
         env = os.environ.copy()
         env["FFMPEG_BIN"] = ff
         # root = %LOCALAPPDATA%\Czysciciel (NIE licz dirname od vpy - vpy jest 4 poziomy
@@ -587,27 +653,43 @@ class MainFrame(wx.Frame):
             args.append("--bez-omijania-muzyki")
         else:
             args += ["--prog-muzyki", f"{opts.get('prog_muzyki', 0.50)}"]
+        if opts.get("dokladny"):
+            args.append("--dokladny")
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", env=env,
                                 creationflags=self._no_window())
-        self._cur_proc = proc
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            if line.startswith("PROGRESS|"):
-                try:
-                    _, pct, msg = line.split("|", 2)
-                    wx.CallAfter(self._progress, int(pct), msg)
-                except Exception: pass
-            elif line.startswith("LOG|"):
-                wx.CallAfter(self.append_log, "  " + line[4:])
-            elif line.startswith("DONE|"):
-                pass
-            elif line.startswith("ERR|"):
-                wx.CallAfter(self.append_log, "  BŁĄD: " + line[4:])
-            elif line.strip():
-                wx.CallAfter(self.append_log, "  " + line)
-        proc.wait()
+        self._procs.add(proc)                 # rejestr do ubijania przy STOP (kilka naraz)
+        try:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if line.startswith("PROGRESS|"):
+                    try:
+                        _, pct, msg = line.split("|", 2)
+                        # PROGRESS tyka co kawalek - za czesto na dziennik. Ląduje w
+                        # slocie statusu (etap biezacego pliku), pasek liczy ukonczone.
+                        wx.CallAfter(self._slot_update, label, msg)
+                    except Exception: pass
+                elif line.startswith("LOG|"):
+                    # LOG = kamienie milowe (remux, detekcja, ile fillerow). Na ZYWO
+                    # do dziennika z tagiem pliku - inaczej przy dlugich plikach cisza.
+                    wx.CallAfter(self.append_log, f"{tag} {line[4:]}")
+                elif line.startswith("DONE|"):
+                    pass
+                elif line.startswith("ERR|"):
+                    wx.CallAfter(self.append_log, f"{tag} BŁĄD: {line[4:]}")
+                elif line.strip():
+                    wx.CallAfter(self.append_log, f"{tag} {line}")
+        finally:
+            proc.wait()
+            self._procs.discard(proc)
         return proc.returncode
+
+    def _slot_update(self, label, msg):
+        """Zapamietaj etap biezacego pliku i odswiez status zbiorczy (glowny watek)."""
+        if hasattr(self, "_slots"):
+            self._slots[label] = msg
+            self._render_status()
+
 
     def _python_for_helper(self, script):
         """Jaki Python odpala bootstrap. Frozen exe: uruchamiamy sam skrypt przez
@@ -627,10 +709,6 @@ class MainFrame(wx.Frame):
         self.gauge.SetValue(max(0, min(100, pct)))
         self.set_status("Instalacja środowiska: " + msg)
 
-    def _progress(self, pct, msg):
-        self.gauge.SetValue(max(0, min(100, pct)))
-        self.set_status(msg)
-
     def set_status(self, s):
         self.lbl_status.SetLabel(s)
 
@@ -639,7 +717,7 @@ class MainFrame(wx.Frame):
 
     def _done(self, ok, done=0, total=0):
         self._set_running(False)
-        self._cur_proc = None
+        self._procs.clear()
         stopped = self.stop_flag.is_set()
         if stopped:
             self.set_status("Zatrzymano.")
