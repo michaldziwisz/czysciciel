@@ -23,7 +23,7 @@ Uzycie:
   python worker.py <wejscie> [wyjscie.mp3] [-p preset] [--bez-pauz]
                    [--min-filler S] [--rpp] [--zostaw-wav]
 """
-import os, sys, json, subprocess, time
+import os, sys, json, subprocess, time, bisect
 
 # Windows: dzieci (ffmpeg) BEZ wlasnego okna konsoli. GUI odpala worker z
 # CREATE_NO_WINDOW, ale flaga nie propaguje sie na wnuki - kazdy subprocess.run
@@ -86,6 +86,8 @@ def _music_model_ref():
             return d, True
     return MUSIC_MODEL, True
 SR = 16000; CHUNK = 30.0; FS = 0.020
+OVERLAP = 3.0              # nakladka okien detekcji fillerow (s) - filler na granicy
+                          # 30s jest w calosci w sasiednim oknie (najdluzszy ~1.6s)
 CUT = 0.30                 # min dlugosc fillera
 KEEP = 0.50; TARGET = 0.45 # pauzy: do KEEP zostaw, dluzsze skroc do TARGET
 SAFE_MS = 20; XF_MS = 25
@@ -117,30 +119,109 @@ def _load_heavy():
     from transformers import AutoFeatureExtractor, Wav2Vec2BertForAudioFrameClassification
     from transformers import ASTForAudioClassification
 
+# ---------- MIEDZYPROCESOWY ZAMEK NA GPU ----------
+# Tryb wsadowy GUI uruchamia kilka workerow rownolegle, by czas CPU (enkode,
+# ciecie) jednego pliku nakladal sie na czas GPU (detekcja) nastepnego. Ale karta
+# jest jedna - dwa modele naraz = OutOfMemory. Ten zamek gwarantuje, ze tylko
+# JEDEN proces liczy na GPU w danej chwili; reszta czeka. Trzymany przez CALY
+# region detekcji (fillery+muzyka), wiec enkode poprzedniego pliku nachodzi na
+# detekcje nastepnego. Blokada plikowa OS zwalnia sie AUTOMATYCZNIE gdy proces
+# ginie (STOP/crash) - brak ryzyka zakleszczenia po ubiciu workera.
+def _gpu_lock_path():
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    d = os.path.join(base, "Czysciciel")
+    try: os.makedirs(d, exist_ok=True)
+    except Exception: pass
+    return os.path.join(d, "gpu.lock")
+
+class GpuLock:
+    """Kontekst: wejscie czeka az GPU bedzie wolne, wyjscie zwalnia. Na CPU no-op."""
+    def __enter__(self):
+        self.fd = None
+        if not torch.cuda.is_available():
+            return self                      # brak wspoldzielonej karty - zamek zbedny
+        self.fd = open(_gpu_lock_path(), "a+")
+        try:                                 # upewnij sie ze jest 1 bajt do zablokowania
+            self.fd.seek(0, os.SEEK_END)
+            if self.fd.tell() == 0: self.fd.write("L"); self.fd.flush()
+        except Exception: pass
+        waited = False
+        while True:
+            try:
+                self.fd.seek(0)
+                if os.name == "nt":
+                    import msvcrt; msvcrt.locking(self.fd.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl; fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if not waited:
+                    log("czekam na GPU (inny plik jest teraz na karcie)..."); waited = True
+                time.sleep(0.5)
+    def __exit__(self, *exc):
+        if self.fd is None: return
+        try:
+            self.fd.seek(0)
+            if os.name == "nt":
+                import msvcrt; msvcrt.locking(self.fd.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl; fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+        except Exception: pass
+        try: self.fd.close()
+        except Exception: pass
+        self.fd = None
+
 # ---------- FILLERY ----------
-def f2i(frames, off, n_total):
+def f2i(frames, off):
+    """Zamienia predykcje ramkowe (0/filler) na interwaly (a,b) w sekundach + offset.
+    NIE odrzuca juz interwalow dotykajacych krawedzi OKNA - przy nakladce (overlap)
+    filler przeciety granica jest widziany w calosci przez sasiednie okno, a duplikaty
+    scalamy pozniej. Odrzucamy tylko za krotkie (< CUT)."""
     res = []; ndf = pd.DataFrame({"t": [FS*i for i in range(len(frames))], "f": frames}).dropna()
     idx = ndf.f.diff()[ndf.f.diff() != 0].index.values
     for si, ei in pairwise(idx):
         if ndf.loc[si:ei-1, "f"].mode()[0] != 0:
             res.append((round(ndf.loc[si, "t"], 3), round(ndf.loc[ei, "t"], 3)))
-    res = [i for i in res if i[1]-i[0] >= CUT and i[0] != 0.0 and i[1] != FS*len(frames)]
+    res = [i for i in res if i[1]-i[0] >= CUT]
     return [(a+off, b+off) for a, b in res]
 
-def detect_fillers(y_full):
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    half = (dev == "cuda")
-    log(f"model na {dev}{' fp16' if half else ''}")
-    progress(15, f"Ladowanie modelu ({dev})...")
-    ref, lfo = _model_ref()
-    fe = AutoFeatureExtractor.from_pretrained(ref, local_files_only=lfo)
-    model = Wav2Vec2BertForAudioFrameClassification.from_pretrained(
-        ref, torch_dtype=torch.float16 if half else torch.float32,
-        local_files_only=lfo).to(dev)
-    model.eval()
-    iv = []; step = int(CHUNK*SR); n = len(y_full)
-    nch = (n+step-1)//step
-    for ci, cs in enumerate(range(0, n, step)):
+def _merge_intervals(iv, gap=0.05):
+    """Scala nakladajace sie / stykajace interwaly (a,b). Konieczne przy nakladce
+    okien - ten sam filler bywa wykryty w dwoch sasiednich oknach."""
+    if not iv: return []
+    iv = sorted(iv)
+    out = [list(iv[0])]
+    for a, b in iv[1:]:
+        if a <= out[-1][1] + gap: out[-1][1] = max(out[-1][1], b)
+        else: out.append([a, b])
+    return [(a, b) for a, b in out]
+
+_FILLER_MODEL = None
+def _get_filler_model():
+    """Laduje model fillerow RAZ (cache modulowy). Iteracja domykajaca wola detekcje
+    wielokrotnie - bez cache przeladowywalaby model z dysku w kazdej rundzie."""
+    global _FILLER_MODEL
+    if _FILLER_MODEL is None:
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        half = (dev == "cuda")
+        log(f"model na {dev}{' fp16' if half else ''}")
+        ref, lfo = _model_ref()
+        fe = AutoFeatureExtractor.from_pretrained(ref, local_files_only=lfo)
+        model = Wav2Vec2BertForAudioFrameClassification.from_pretrained(
+            ref, torch_dtype=torch.float16 if half else torch.float32,
+            local_files_only=lfo).to(dev)
+        model.eval()
+        _FILLER_MODEL = (fe, model, dev, half)
+    return _FILLER_MODEL
+
+def detect_fillers(y_full, p_lo=20, p_hi=70, verbose=True):
+    fe, model, dev, half = _get_filler_model()
+    # NAKLADKA (overlap): okna nachodza na siebie o OVERLAP s, wiec filler przeciety
+    # granica okna jest w calosci wewnatrz sasiedniego okna - inaczej gubimy fillery
+    # na szwach co CHUNK s (objaw: drugi przebieg czyszczenia dokladal kolejne).
+    iv = []; step = int(CHUNK*SR); hop = int((CHUNK-OVERLAP)*SR); n = len(y_full)
+    nch = (n+hop-1)//hop
+    for ci, cs in enumerate(range(0, n, hop)):
         ch = y_full[cs:cs+step]
         if len(ch) < int(0.5*SR): continue
         try:
@@ -157,10 +238,14 @@ def detect_fillers(y_full):
                 pred = m_cpu(**inp).logits.argmax(-1)[0].numpy()
                 model.to(dev)
                 if half: model.half()
-        iv += f2i(pred.tolist(), cs/SR, n)
-        # detekcja fillerow to 20..70% paska
-        progress(20 + 50*(ci+1)/max(nch, 1), f"Detekcja fillerow: {ci+1}/{nch}")
-        if ci % 20 == 0: log(f"  fillery: kawalek {ci+1}/{nch}")
+        iv += f2i(pred.tolist(), cs/SR)
+        progress(p_lo + (p_hi-p_lo)*(ci+1)/max(nch, 1), f"Detekcja fillerow: {ci+1}/{nch}")
+        if verbose and ci % 20 == 0: log(f"  fillery: kawalek {ci+1}/{nch}")
+    # scal duplikaty z nakladki + odrzuc fillery na SKRAJNYCH krawedziach materialu
+    # (poczatek 0.0 i sam koniec - tam nie ma kontekstu, model bywa niepewny)
+    iv = _merge_intervals(iv)
+    dur = n/SR
+    iv = [(a, b) for a, b in iv if a > 0.0 and b < dur - 0.02]
     return iv
 
 # ---------- PAUZY ----------
@@ -263,6 +348,97 @@ def filter_cuts_by_music(allc, music_regions):
         return allc, 0
     kept = [c for c in allc if not _in_music(c["a"], c["b"], music_regions)]
     return kept, len(allc) - len(kept)
+
+# ---------- ITERACJA DOMYKAJACA (idempotencja) ----------
+# Detekcja per-okno + prog daja efekt: plik przemielony ponownie lapie kilka nowych,
+# krotkich fillerow/pauz (graniczne przypadki, ktore po zmianie kontekstu przekraczaja
+# prog). Zeby POJEDYNCZY przebieg dawal plik idempotentny (kolejne czyszczenia lapia
+# zero), iterujemy TU: wykrywamy na sygnale bez dotychczasowych ciec, mapujemy nowe na
+# os oryginalu, akumulujemy - az kolejna runda usuwalaby < progu. Pomiar (odc.15min):
+# fillery 67->5->2->0, wiec zbiega; pauzy szumia ale usuwaja 0s (stop po realnym czasie).
+ITER_MAX = 6                 # twardy limit rund (bezpiecznik na wypadek oscylacji)
+ITER_MAX_DOKLADNY = 30       # tryb dokladny: iteruj "do oporu", ale i tak z bezpiecznikiem
+ITER_MIN_GAIN_S = 0.30       # stop gdy runda dokladaby mniej wycietego czasu niz tyle
+
+def _build_kept_signal(y, cuts_samples):
+    """Z sygnalu y (16k) usuwa przedzialy cuts_samples (probki), zwraca (y2, keeps)."""
+    n = len(y)
+    ci = sorted([max(0,s), min(n,e)] for s, e in cuts_samples if e > s)
+    merged = []
+    for s, e in ci:
+        if merged and s <= merged[-1][1]: merged[-1][1] = max(merged[-1][1], e)
+        else: merged.append([s, e])
+    keeps = []; prev = 0
+    for s, e in merged:
+        if s > prev: keeps.append((prev, s))
+        prev = e
+    if prev < n: keeps.append((prev, n))
+    y2 = np.concatenate([y[s:e] for s, e in keeps]) if keeps else np.zeros(0, dtype=y.dtype)
+    return y2, keeps
+
+def _map_back(iv_new, keeps):
+    """Mapuje interwaly (a,b) w sekundach z osi SYGNALU-BEZ-CIEC na os ORYGINALU
+    (przez segmenty keeps, w probkach)."""
+    starts_new = []; acc = 0
+    for s, e in keeps:
+        starts_new.append(acc); acc += (e - s)
+    def m(t):
+        p = int(round(t*SR))
+        i = bisect.bisect_right(starts_new, p) - 1
+        i = max(0, min(i, len(keeps)-1))
+        return (keeps[i][0] + (p - starts_new[i])) / SR
+    return [(m(a), m(b)) for a, b in iv_new]
+
+def detect_all_cuts_iterative(y, tnij_fillery, tnij_cisze, dokladny=False):
+    """Zwraca allc - liste ciec {a,b,dur,typ} na osi ORYGINALU, domknieta iteracyjnie
+    tak, by ponowne czyszczenie wyniku lapalo ~zero. Model ladowany raz.
+    dokladny=True: iteruje DO OPORU (az realny przyrost = 0), bez limitu ITER_MAX."""
+    total_cuts = []               # (a,b,typ) na osi oryginalu, akumulowane
+    n = len(y)
+    limit = ITER_MAX_DOKLADNY if dokladny else ITER_MAX
+    min_gain = 0.0 if dokladny else ITER_MIN_GAIN_S   # dokladny: stop dopiero gdy 0s
+    rnd = 0
+    while rnd < limit:
+        rnd += 1
+        if rnd == 1:
+            log("weryfikacja: runda 1 (detekcja fillerów i pauz)...")
+        else:
+            log(f"weryfikacja: runda {rnd} (sprawdzam, czy zostało coś do wycięcia)...")
+        # sygnal po dotychczasowych cieciach (w probkach) - na nim szukamy NOWYCH
+        cur_samples = [(int(a*SR), int(b*SR)) for a, b, _ in total_cuts]
+        y2, keeps = _build_kept_signal(y, cur_samples) if total_cuts else (y, [(0, n)])
+        if len(y2) < int(0.5*SR): break
+        # pasek: 1. runda zajmuje glowna czesc (20..66%), kolejne domykaja (66..70%)
+        if rnd == 1: p_lo, p_hi = 20, 66
+        else: p_lo, p_hi = 66, 70
+        f_new = detect_fillers(y2, p_lo=p_lo, p_hi=p_hi, verbose=(rnd == 1)) if tnij_fillery else []
+        p_new = detect_pauses(y2) if tnij_cisze else []
+        # mapuj z osi sygnalu-bez-ciec na os oryginalu
+        if total_cuts:
+            f_new = _map_back(f_new, keeps); p_new = _map_back(p_new, keeps)
+        new = [(a, b, "filler") for a, b in f_new] + [(a, b, "pauza") for a, b in p_new]
+        if rnd == 1:
+            log(f"fillery: {len(f_new)}"); log(f"pauzy do skrócenia: {len(p_new)}")
+        # ile REALNEGO czasu wycietego (po SAFE/xf/merge) mamy PRZED i PO tej rundzie
+        # - OBA liczone tak samo przez compute_keeps, inaczej miary sa niespojne
+        def _cut_frames(cuts):
+            _, merged = compute_keeps(n, SR, [(a, b) for a, b, _ in cuts])
+            return sum(e-s for s, e in merged)
+        prev_frames = _cut_frames(total_cuts)
+        cand = total_cuts + new
+        now_frames = _cut_frames(cand)
+        gain_s = (now_frames - prev_frames)/SR
+        if rnd > 1:
+            if gain_s <= min_gain:
+                log(f"  weryfikacja: runda {rnd} nic już nie wycina (+{gain_s:.2f}s) - koniec")
+                break
+            log(f"  weryfikacja: runda {rnd} domknęła jeszcze +{gain_s:.2f}s ({len(new)} cięć)")
+            progress(66 + 4*min(rnd, ITER_MAX)/ITER_MAX, f"Weryfikacja ({rnd})...")
+        total_cuts = cand
+        if not new: break
+    allc = [{"a": a, "b": b, "dur": b-a, "typ": t} for a, b, t in total_cuts]
+    allc.sort(key=lambda z: z["a"])
+    return allc
 
 # ---------- KEEP SEGMENTS (wspolne dla ciecia i eksportu RPP) ----------
 def compute_keeps(total_frames, sr, cuts):
@@ -651,6 +827,8 @@ def main():
     ap.add_argument("--prog-muzyki", type=float, default=MUSIC_THRESH,
                     help=f"prog czulosci wykrywania muzyki 0..1 (domyslnie {MUSIC_THRESH}; "
                          "wyzszy = chroni tylko wyrazna muzyke, tlo tnie; nizszy = chroni juz przy sladzie muzyki)")
+    ap.add_argument("--dokladny", action="store_true",
+                    help="tryb dokladny: weryfikuj DO OPORU (wiele rund az nic nie zostanie do wyciecia); wydluza przetwarzanie")
     # zgodnosc wstecz:
     ap.add_argument("--bez-pauz", action="store_true", help="alias --tryb fillery")
     ap.add_argument("--rpp", action="store_true", help="alias --eksport oba")
@@ -703,39 +881,36 @@ def main():
             src_wav = ain
         ain_proc = src_wav
 
-        # 2. wczytanie 16k mono + detekcja
+        # 2. wczytanie 16k mono + detekcja (region GPU pod miedzyprocesowym zamkiem:
+        # w trybie wsadowym enkode/ciecie poprzedniego pliku (CPU) nachodzi na
+        # detekcje nastepnego (GPU), ale na karcie jest zawsze tylko JEDEN worker)
         progress(12, "Wczytywanie audio...")
         log(f"wczytuję {ain_proc} (16k mono do detekcji)")
         y, _ = librosa.load(ain_proc, sr=SR, mono=True)
         log(f"długość {len(y)/SR:.0f}s")
 
-        fillers = detect_fillers(y) if tnij_fillery else []
-        log(f"fillery: {len(fillers)}")
-        progress(72, "Detekcja ciszy (pauz)..." if tnij_cisze else "Pomijam ciszę...")
-        pauses = detect_pauses(y) if tnij_cisze else []
-        log(f"pauzy do skrócenia: {len(pauses)}")
+        with GpuLock():
+            # detekcja iteracyjna: domyka wynik tak, by ponowne czyszczenie lapalo ~zero
+            allc = detect_all_cuts_iterative(y, tnij_fillery, tnij_cisze, dokladny=a.dokladny)
 
-        allc = [{"a": aa, "b": bb, "dur": bb-aa, "typ": "filler"} for aa, bb in fillers] + \
-               [{"a": aa, "b": bb, "dur": bb-aa, "typ": "pauza"} for aa, bb in pauses]
-        allc.sort(key=lambda z: z["a"])
-
-        # 2b. MUZYKA: domyslnie chronimy fragmenty z muzyka - odrzucamy ciecia w muzyce
-        # (model fillerow myli spiew/instrumenty z "yyy"). Wylaczane --bez-omijania-muzyki.
-        omijaj_muzyke = not a.bez_omijania_muzyki
-        if omijaj_muzyke and allc:
-            log(f"ochrona muzyki: włączona (próg {MUSIC_THRESH:.2f})")
-            music = detect_music(y)
-            before = len(allc)
-            allc, removed = filter_cuts_by_music(allc, music)
-            if music:
-                log(f"muzyka chroniona: odrzucono {removed}/{before} cięć w muzyce")
-            # gdy prawie caly material to muzyka - ostrzez (bramka calego pliku)
-            if music:
-                total_music = sum(b-a for a, b in music)
-                if total_music >= 0.9 * (len(y)/SR):
-                    log("UWAGA: materiał to niemal w całości muzyka - nic nie wycinam")
-        elif not omijaj_muzyke:
-            log("omijanie muzyki WYŁĄCZONE - tnę w całym materiale")
+            # 2b. MUZYKA: domyslnie chronimy fragmenty z muzyka - odrzucamy ciecia w muzyce
+            # (model fillerow myli spiew/instrumenty z "yyy"). Wylaczane --bez-omijania-muzyki.
+            omijaj_muzyke = not a.bez_omijania_muzyki
+            if omijaj_muzyke and allc:
+                log(f"ochrona muzyki: włączona (próg {MUSIC_THRESH:.2f})")
+                music = detect_music(y)
+                before = len(allc)
+                allc, removed = filter_cuts_by_music(allc, music)
+                if music:
+                    log(f"muzyka chroniona: odrzucono {removed}/{before} cięć w muzyce")
+                # gdy prawie caly material to muzyka - ostrzez (bramka calego pliku)
+                if music:
+                    total_music = sum(b-a for a, b in music)
+                    if total_music >= 0.9 * (len(y)/SR):
+                        log("UWAGA: materiał to niemal w całości muzyka - nic nie wycinam")
+            elif not omijaj_muzyke:
+                log("omijanie muzyki WYŁĄCZONE - tnę w całym materiale")
+        # <- tu zamek GPU zwolniony: dalej same operacje CPU/dysk (ciecie, enkode)
 
         json.dump({"fillers": allc}, open(os.path.join(outdir, f"ciecia_{stem}.json"), "w"), indent=1)
 
