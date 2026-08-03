@@ -249,6 +249,25 @@ class MainFrame(wx.Frame):
         self.sl_muzyka.Bind(wx.EVT_SLIDER, self.on_prog_change)
         self.cb_muzyka.Bind(wx.EVT_CHECKBOX, self.on_muzyka_toggle)
 
+        # --- dodatkowe odglosy do wyciecia (chrzakniecia/kaszel, oddechy, mlasniecia) ---
+        # Wykrywane tym samym modelem AudioSet co muzyka, wycinane jak fillery: tylko
+        # tam gdzie NIE ma muzyki (podlegaja ochronie muzyki) ani mowy (guard). Bez
+        # suwakow - Michal: "regulowac tu nie ma sensu". Domyslnie WYLACZONE.
+        lbl_odg = wx.StaticText(panel, label="Dodatkowo wycinaj odgłosy (gdy nie ma muzyki):")
+        root.Add(lbl_odg, 0, wx.LEFT | wx.TOP, 8)
+        self.cb_chrzak = wx.CheckBox(panel,
+            label="&Chrząknięcia, kaszel, kichnięcia")
+        self.cb_chrzak.SetName("Wycinaj chrząknięcia, kaszel i kichnięcia")
+        root.Add(self.cb_chrzak, 0, wx.LEFT | wx.RIGHT, 8)
+        self.cb_oddech = wx.CheckBox(panel,
+            label="&Oddechy, wdechy, pociągnięcia nosem")
+        self.cb_oddech.SetName("Wycinaj oddechy, wdechy i pociągnięcia nosem")
+        root.Add(self.cb_oddech, 0, wx.LEFT | wx.RIGHT, 8)
+        self.cb_mlask = wx.CheckBox(panel,
+            label="M&laśnięcia, cmoknięcia, kliknięcia ustne")
+        self.cb_mlask.SetName("Wycinaj mlaśnięcia, cmoknięcia i kliknięcia ustne")
+        root.Add(self.cb_mlask, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
         # --- folder wyjsciowy ---
         r3 = wx.BoxSizer(wx.HORIZONTAL)
         lbl_out = wx.StaticText(panel, label="Folder &wyjściowy:")
@@ -475,6 +494,9 @@ class MainFrame(wx.Frame):
             "prog_muzyki": self.sl_muzyka.GetValue(),
             "workers": self.sc_workers.GetValue(),
             "dokladny": self.cb_dokladny.GetValue(),
+            "tnij_chrzak": self.cb_chrzak.GetValue(),
+            "tnij_oddech": self.cb_oddech.GetValue(),
+            "tnij_mlask": self.cb_mlask.GetValue(),
             "outdir": self.txt_out.GetValue().strip(),
         }
 
@@ -515,6 +537,9 @@ class MainFrame(wx.Frame):
         _val(self.sl_muzyka, "prog_muzyki", int)
         _val(self.sc_workers, "workers", int)
         _val(self.cb_dokladny, "dokladny", bool)
+        _val(self.cb_chrzak, "tnij_chrzak", bool)
+        _val(self.cb_oddech, "tnij_oddech", bool)
+        _val(self.cb_mlask, "tnij_mlask", bool)
         outdir = s.get("outdir")
         if isinstance(outdir, str) and outdir:
             self.txt_out.SetValue(outdir)
@@ -529,7 +554,8 @@ class MainFrame(wx.Frame):
                   self.btn_clear, self.btn_out, self.ch_preset, self.sc_minfiller,
                   self.rb_tryb, self.rb_eksport, self.ch_format, self.ch_kanaly,
                   self.ch_bitrate, self.cb_wyciete, self.cb_muzyka, self.sl_muzyka,
-                  self.rb_wariant, self.sc_workers, self.cb_dokladny):
+                  self.rb_wariant, self.sc_workers, self.cb_dokladny,
+                  self.cb_chrzak, self.cb_oddech, self.cb_mlask):
             b.Enable(not running)
         if not running:
             self.on_format_change(None)   # przywroc poprawny stan bitrate
@@ -560,11 +586,15 @@ class MainFrame(wx.Frame):
         outdir = self.txt_out.GetValue().strip() or None
         workers = self.sc_workers.GetValue()
         dokladny = self.cb_dokladny.GetValue()
+        tnij_chrzak = self.cb_chrzak.GetValue()
+        tnij_oddech = self.cb_oddech.GetValue()
+        tnij_mlask = self.cb_mlask.GetValue()
         opts = dict(preset=preset, minf=minf, tryb=tryb, eksport=eksport,
                     fmt=fmt, bitrate=bitrate, kanaly=kanaly, outdir=outdir,
                     zapisz_wyciete=zapisz_wyciete, wariant_rpp=wariant_rpp,
                     omijaj_muzyke=omijaj_muzyke, prog_muzyki=prog_muzyki, workers=workers,
-                    dokladny=dokladny)
+                    dokladny=dokladny, tnij_chrzak=tnij_chrzak, tnij_oddech=tnij_oddech,
+                    tnij_mlask=tnij_mlask)
         self.stop_flag.clear()
         self._set_running(True)
         self.gauge.SetValue(0)
@@ -725,6 +755,12 @@ class MainFrame(wx.Frame):
             args += ["--prog-muzyki", f"{opts.get('prog_muzyki', 0.50)}"]
         if opts.get("dokladny"):
             args.append("--dokladny")
+        if opts.get("tnij_chrzak"):
+            args.append("--tnij-chrzakniecia")
+        if opts.get("tnij_oddech"):
+            args.append("--tnij-oddechy")
+        if opts.get("tnij_mlask"):
+            args.append("--tnij-mlasniecia")
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", env=env,
                                 creationflags=self._no_window())
