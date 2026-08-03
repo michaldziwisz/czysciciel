@@ -96,6 +96,32 @@ MUSIC_WIN = 4.0            # dlugosc okna analizy muzyki (s) - rozdzielczosc det
 MUSIC_THRESH = 0.50        # prog prawdopodobienstwa klasy "Music" (sigmoid)
 MUSIC_PAD = 0.30           # margines rozszerzenia regionu muzyki (s) w kazda strone
 
+# --- wykrywanie ODGLOSOW do wyciecia (chrzakniecia/kaszel, oddechy, mlasniecia) ---
+# Uzywa TEGO SAMEGO modelu AST (AudioSet) co ochrona muzyki. Skanuje gestszym oknem
+# (lepsza lokalizacja krotkich zdarzen) i wycina okna, w ktorych dany odglos jest
+# obecny A JEDNOCZESNIE NIE MA w nich mowy (p(Speech) < guard). Dzieki temu usuwamy
+# tylko odglosy wystepujace SAMODZIELNIE (w przerwach) - jak fillery - a nie tniemy
+# glosu. Wykryte ciecia przechodza pozniej przez ten sam filtr muzyki (poza muzyka).
+SOUND_WIN = 1.0            # dlugosc okna analizy odglosow (s)
+SOUND_HOP = 0.5            # krok okna (nakladka dla lepszej lokalizacji)
+SOUND_PAD = 0.05           # margines rozszerzenia regionu odglosu (s) - maly, by nie
+                           # zjadac poczatku sasiedniego slowa
+SOUND_THRESH = 0.15        # prog sigmoid dla klas odglosu (AudioSet dla tych klas bywa
+                           # niski, wiec prog nizszy niz przy muzyce) - do kalibracji uchem
+SOUND_SPEECH_GUARD = 0.15  # prog p(mowa) uznajacy okno za "mowa" (do sasiedztwa nizej)
+SOUND_SPEECH_CTX = 0.3     # tnij odglos tylko gdy w promieniu tylu sekund NIE ma mowy
+                           # (odglos IZOLOWANY w przerwie). Chroni koncowki slow (szum
+                           # glosek s/sz/f przyklejony do samogloski) i poczatki wypowiedzi;
+                           # maly promien, by lapac oddechy blisko zdan (oddech przed/po).
+# nazwy klas AudioSet per kategoria (dopasowanie po nazwie w id2label modelu)
+SOUND_CLASSES = {
+    "chrzakniecia": ["Throat clearing", "Cough", "Sneeze", "Snort"],
+    "oddechy":      ["Breathing", "Gasp", "Sigh", "Sniff", "Pant", "Wheeze"],
+    "mlasniecia":   ["Chewing, mastication", "Biting", "Clicking"],
+}
+SPEECH_CLASSES = ["Speech", "Male speech, man speaking",
+                  "Female speech, woman speaking", "Child speech, kid speaking"]
+
 # --- komunikacja z GUI ---
 def emit(kind, payload):
     print(f"{kind}|{payload}", flush=True)
@@ -214,6 +240,30 @@ def _get_filler_model():
         _FILLER_MODEL = (fe, model, dev, half)
     return _FILLER_MODEL
 
+_AST_MODEL = None
+def _get_ast_model():
+    """Laduje model AST (AudioSet) RAZ i buduje mape nazwa_klasy -> indeks.
+    Wspoldzielony przez ochrone MUZYKI i wycinanie ODGLOSOW (chrzakniecia/oddechy/
+    mlasniecia) - inaczej ladowalibysmy ten sam ~350MB model dwa razy. Zwraca
+    (fe, model, dev, half, label2idx) albo rzuca wyjatek (obslugiwany przez wolajacego)."""
+    global _AST_MODEL
+    if _AST_MODEL is None:
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        half = (dev == "cuda")
+        ref, lfo = _music_model_ref()
+        log(f"model odgłosów/muzyki (AST) na {dev}{' fp16' if half else ''}")
+        fe = AutoFeatureExtractor.from_pretrained(ref, local_files_only=lfo)
+        model = ASTForAudioClassification.from_pretrained(
+            ref, torch_dtype=torch.float16 if half else torch.float32,
+            local_files_only=lfo).to(dev)
+        model.eval()
+        id2label = getattr(model.config, "id2label", {}) or {}
+        label2idx = {}
+        for k, v in id2label.items():
+            label2idx[str(v).strip().lower()] = int(k)
+        _AST_MODEL = (fe, model, dev, half, label2idx)
+    return _AST_MODEL
+
 def detect_fillers(y_full, p_lo=20, p_hi=70, verbose=True):
     fe, model, dev, half = _get_filler_model()
     # NAKLADKA (overlap): okna nachodza na siebie o OVERLAP s, wiec filler przeciety
@@ -275,22 +325,10 @@ def detect_music(y_full):
     rozszerzamy o MUSIC_PAD z kazdej strony (zeby zlapac naboki/wybrzmienia). Blad
     ladowania modelu = brak muzyki (pusta lista) - lepiej wyczyscic niz pasc."""
     try:
-        dev = "cuda" if torch.cuda.is_available() else "cpu"
-        half = (dev == "cuda")
-        ref, lfo = _music_model_ref()
+        fe, model, dev, half, label2idx = _get_ast_model()
         progress(72, "Ładowanie modelu wykrywania muzyki...")
-        log(f"model muzyki na {dev}{' fp16' if half else ''}")
-        fe = AutoFeatureExtractor.from_pretrained(ref, local_files_only=lfo)
-        model = ASTForAudioClassification.from_pretrained(
-            ref, torch_dtype=torch.float16 if half else torch.float32,
-            local_files_only=lfo).to(dev)
-        model.eval()
-        # indeks klasy "Music" z mapy etykiet modelu (id2label). Fallback: 137 (AudioSet).
-        music_idx = None
-        id2label = getattr(model.config, "id2label", {}) or {}
-        for k, v in id2label.items():
-            if str(v).strip().lower() == "music":
-                music_idx = int(k); break
+        # indeks klasy "Music" z mapy etykiet modelu. Fallback: 137 (AudioSet).
+        music_idx = label2idx.get("music")
         if music_idx is None:
             music_idx = 137
             log("nie znaleziono etykiety 'Music' w modelu - uzywam indeksu 137")
@@ -333,6 +371,101 @@ def detect_music(y_full):
     total_music = sum(b-a for a, b in regions)
     log(f"muzyka: {len(regions)} region(ow), lacznie {total_music/60:.1f} min")
     return [(a, b) for a, b in regions]
+
+# ---------- ODGLOSY: chrzakniecia/kaszel, oddechy, mlasniecia (AST/AudioSet) ----------
+def detect_sounds(y_full, kategorie):
+    """Zwraca liste ciec {a,b,dur,typ} dla wybranych KATEGORII odglosow (na osi
+    oryginalu). Uzywa tego samego modelu AST co detect_music. Dla kazdego okna
+    (SOUND_WIN, krok SOUND_HOP) liczy sigmoid logitow; okno kwalifikuje sie do
+    wyciecia gdy MAX prawdopodobienstwo klas danej kategorii >= SOUND_THRESH ORAZ
+    p(mowa) < SOUND_SPEECH_GUARD (chronimy glos - tniemy tylko odglosy wystepujace
+    samodzielnie w przerwach, jak fillery). Sasiednie okna tej samej kategorii scala
+    w regiony + margines SOUND_PAD. Blad modelu = pusta lista (worker nie pada).
+    kategorie: lista kluczy z SOUND_CLASSES (np. ['chrzakniecia','oddechy']).
+    """
+    kategorie = [k for k in kategorie if k in SOUND_CLASSES]
+    if not kategorie:
+        return []
+    try:
+        fe, model, dev, half, label2idx = _get_ast_model()
+        progress(76, "Ładowanie modelu wykrywania odgłosów...")
+    except Exception as e:
+        log(f"model odgłosów niedostepny ({e!r}) - pomijam wykrywanie odgłosów")
+        return []
+    # indeksy klas per kategoria + indeksy mowy (guard)
+    cat_idx = {}
+    for kat in kategorie:
+        idxs = [label2idx[nm.lower()] for nm in SOUND_CLASSES[kat] if nm.lower() in label2idx]
+        if idxs:
+            cat_idx[kat] = idxs
+    if not cat_idx:
+        log("nie znaleziono etykiet odgłosów w modelu - pomijam")
+        return []
+    speech_idx = [label2idx[nm.lower()] for nm in SPEECH_CLASSES if nm.lower() in label2idx]
+    win = int(SOUND_WIN * SR); hop = int(SOUND_HOP * SR); n = len(y_full)
+    nwin = (n + hop - 1) // hop
+    # 1. przelot: per okno zapisz p(mowa) i kandydatow odglosu (a,b,kat). Decyzje o
+    # cieciu podejmujemy w 2. przelocie, bo potrzebujemy KONTEKSTU (mowa obok).
+    speech_win = []              # (a_s, b_s, p_speech) dla kazdego okna
+    cand = []                    # (a_s, b_s, kat) - okno przekroczylo prog odglosu
+    for wi, ws in enumerate(range(0, n, hop)):
+        ch = y_full[ws:ws+win]
+        if len(ch) < int(0.3*SR):
+            continue
+        try:
+            with torch.no_grad():
+                inp = fe([ch], return_tensors="pt", sampling_rate=SR).to(dev)
+                if half: inp = {k: (v.half() if v.dtype == torch.float32 else v) for k, v in inp.items()}
+                probs = torch.sigmoid(model(**inp).logits.float()[0])
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            with torch.no_grad():
+                inp = fe([ch], return_tensors="pt", sampling_rate=SR)
+                m_cpu = model.float().cpu()
+                probs = torch.sigmoid(m_cpu(**inp).logits.float()[0])
+                model.to(dev)
+                if half: model.half()
+        a_s, b_s = ws/SR, (ws+len(ch))/SR
+        p_speech = max((probs[i].item() for i in speech_idx), default=0.0)
+        speech_win.append((a_s, b_s, p_speech))
+        for kat, idxs in cat_idx.items():
+            if max(probs[i].item() for i in idxs) >= SOUND_THRESH:
+                cand.append((a_s, b_s, kat))
+        if wi % 40 == 0:
+            progress(76 + 2*(wi+1)/max(nwin, 1), f"Wykrywanie odgłosów: {wi+1}/{nwin}")
+    # regiony MOWY (okna z p_speech >= guard) - do sprawdzania sasiedztwa kandydatow
+    speech_reg = [(a, b) for (a, b, ps) in speech_win if ps >= SOUND_SPEECH_GUARD]
+    def _mowa_obok(a, b):
+        """Czy w promieniu SOUND_SPEECH_CTX od [a,b] jest jakies okno z mowa?"""
+        lo, hi = a - SOUND_SPEECH_CTX, b + SOUND_SPEECH_CTX
+        for (sa, sb) in speech_reg:
+            if sa < hi and sb > lo:
+                return True
+        return False
+    # 2. przelot: zostaw tylko odglosy IZOLOWANE (bez mowy w sasiedztwie) - chroni
+    # koncowki slow (s/sz/f) i poczatki wypowiedzi, gdzie mowa jest tuz obok.
+    hits = {kat: [] for kat in cat_idx}
+    for (a_s, b_s, kat) in cand:
+        if not _mowa_obok(a_s, b_s):
+            hits[kat].append((a_s, b_s))
+    # scal okna kazdej kategorii w regiony + margines, zbuduj ciecia
+    out = []
+    typ_nazwa = {"chrzakniecia": "chrząknięcie", "oddechy": "oddech", "mlasniecia": "mlaśnięcie"}
+    for kat, iv in hits.items():
+        if not iv:
+            continue
+        iv.sort()
+        regions = []
+        for a, b in iv:
+            a = max(0.0, a - SOUND_PAD); b = b + SOUND_PAD
+            if regions and a <= regions[-1][1]:
+                regions[-1][1] = max(regions[-1][1], b)
+            else:
+                regions.append([a, b])
+        for a, b in regions:
+            out.append({"a": a, "b": b, "dur": b-a, "typ": typ_nazwa.get(kat, kat)})
+        log(f"odgłosy [{typ_nazwa.get(kat, kat)}]: {len(regions)} fragment(ow)")
+    return out
 
 def _in_music(a, b, music_regions):
     """Czy odcinek [a,b] (s) NACHODZI na ktorykolwiek region muzyki."""
@@ -829,6 +962,14 @@ def main():
                          "wyzszy = chroni tylko wyrazna muzyke, tlo tnie; nizszy = chroni juz przy sladzie muzyki)")
     ap.add_argument("--dokladny", action="store_true",
                     help="tryb dokladny: weryfikuj DO OPORU (wiele rund az nic nie zostanie do wyciecia); wydluza przetwarzanie")
+    # ODGLOSY: dodatkowe kategorie do wyciecia (jak fillery: tylko poza muzyka i mowa).
+    # Domyslnie WYLACZONE - wlaczane osobnymi flagami (GUI: checkboxy).
+    ap.add_argument("--tnij-chrzakniecia", action="store_true",
+                    help="wycinaj chrzakniecia, kaszel, kichniecia (poza muzyka i mowa)")
+    ap.add_argument("--tnij-oddechy", action="store_true",
+                    help="wycinaj oddechy, wdechy, pociagniecia nosem (poza muzyka i mowa)")
+    ap.add_argument("--tnij-mlasniecia", action="store_true",
+                    help="wycinaj mlasniecia, cmokniecia, kliki ustne (poza muzyka i mowa)")
     # zgodnosc wstecz:
     ap.add_argument("--bez-pauz", action="store_true", help="alias --tryb fillery")
     ap.add_argument("--rpp", action="store_true", help="alias --eksport oba")
@@ -892,6 +1033,50 @@ def main():
         with GpuLock():
             # detekcja iteracyjna: domyka wynik tak, by ponowne czyszczenie lapalo ~zero
             allc = detect_all_cuts_iterative(y, tnij_fillery, tnij_cisze, dokladny=a.dokladny)
+
+            # 2a. ODGLOSY (chrzakniecia/kaszel, oddechy, mlasniecia) - dodatkowe ciecia
+            # wykryte modelem AST, tylko poza mowa (guard w detect_sounds). Dodajemy do
+            # allc PRZED filtrem muzyki, zeby tez podlegaly ochronie muzyki.
+            kategorie = []
+            if a.tnij_chrzakniecia: kategorie.append("chrzakniecia")
+            if a.tnij_oddechy: kategorie.append("oddechy")
+            if a.tnij_mlasniecia: kategorie.append("mlasniecia")
+            if kategorie:
+                opisy = {"chrzakniecia": "chrząknięcia/kaszel", "oddechy": "oddechy",
+                         "mlasniecia": "mlaśnięcia"}
+                log("wykrywanie odgłosów: " + ", ".join(opisy[k] for k in kategorie))
+                # WYKRYWAJ ODGLOSY NA SYGNALE PO WYCIECIU FILLEROW/PAUZ, nie na oryginale.
+                # Model AST slyszy przeciagniety filler "yyy/eee" jako mowe (Speech), wiec
+                # guard mowy w detect_sounds chronilby oddechy sasiadujace z fillerami - a te
+                # fillery i tak wycinamy. Na sygnale-bez-fillerow guard ocenia PRAWDZIWA mowe,
+                # wiec oddech przy (bylym) fillerze staje sie izolowany i jest ciety; oddech
+                # przy realnym slowie dalej chroniony.
+                cur_samples = [(int(c["a"]*SR), int(c["b"]*SR)) for c in allc]
+                if cur_samples:
+                    y_snd, keeps_snd = _build_kept_signal(y, cur_samples)
+                else:
+                    y_snd, keeps_snd = y, [(0, len(y))]
+                snd = detect_sounds(y_snd, kategorie)
+                if snd and cur_samples:
+                    # mapuj regiony z osi sygnalu-bez-fillerow na os ORYGINALU. Region
+                    # przekraczajacy szew (granice keep-segmentu = miejsce po wycietym
+                    # fillerze) ROZBIJAMY per segment, by NIGDY nie ciac przez szew w
+                    # zachowane audio (inaczej ryzyko wciecia w realne slowo obok ciecia).
+                    bounds = []; acc = 0
+                    for s, e in keeps_snd:
+                        bounds.append((acc/SR, (acc+(e-s))/SR, s/SR)); acc += (e - s)
+                    mapped = []
+                    for c in snd:
+                        for (ns, ne, so) in bounds:
+                            lo = max(c["a"], ns); hi = min(c["b"], ne)
+                            if hi > lo:
+                                mapped.append({"a": so+(lo-ns), "b": so+(hi-ns),
+                                               "dur": hi-lo, "typ": c["typ"]})
+                    snd = mapped
+                if snd:
+                    allc = allc + snd
+                    allc.sort(key=lambda z: z["a"])
+                    log(f"odgłosy: dodano {len(snd)} fragmentów do wycięcia")
 
             # 2b. MUZYKA: domyslnie chronimy fragmenty z muzyka - odrzucamy ciecia w muzyce
             # (model fillerow myli spiew/instrumenty z "yyy"). Wylaczane --bez-omijania-muzyki.
