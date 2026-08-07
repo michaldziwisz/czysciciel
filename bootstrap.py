@@ -22,6 +22,7 @@ Protokol postepu (STDOUT, parsowany przez GUI):
     BOOTERR|<komunikat>
 """
 import os, sys, json, subprocess, shutil, urllib.request, zipfile, tempfile, ssl, time
+import hashlib
 
 # Windows: uruchamiaj procesy potomne BEZ wlasnego okna konsoli. GUI odpala
 # bootstrap z CREATE_NO_WINDOW, ale ta flaga NIE propaguje sie na WNUKI - kazdy
@@ -48,6 +49,14 @@ PKGS_COMMON = [
     "pandas==3.0.3",
     "numpy==2.4.6",
     "huggingface_hub==1.24.0",
+    # guard mowy (Silero VAD): CZYSTY onnxruntime, BEZ pakietu `silero-vad` z pip -
+    # ten dociaga torchaudio 2.11, ktore ZAWIESZA `import torch` przy torch 2.7.0+cu128
+    # (sprawdzone: kilka przebiegow po 5-10 min bez zadnego outputu). onnxruntime
+    # wspolistnieje z torchem bez problemu - zweryfikowane, CUDA nadal dziala.
+    "onnxruntime==1.28.0",
+    # cechy fbank (80 pasm) dla modelu glosow CAMPPlus - funkcja CHRONIONE GLOSY.
+    # Mala paczka (~1 MB), TEZ bez torchaudio.
+    "kaldi_native_fbank==1.22.3",
 ]
 # torch: cu128 obejmuje karty od sm_75 (RTX 20xx) po sm_120 (RTX 50xx Blackwell).
 # cu121 (do 2.5.1) NIE mial sm_120 - RTX 50xx padal "no kernel image". 2.7.0 to
@@ -59,7 +68,25 @@ TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 UV_URL = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
 # ffmpeg statyczny (LGPL) - build BtbN. release/latest niezmiennie dostepny.
 FFMPEG_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip"
+# DeepFilterNet3 (odszumianie mowy, 48 kHz, licencja MIT/Apache-2.0) - GOTOWY exe z
+# Releases: zero zaleznosci Pythona/Rusta. Wersja przypieta (nie 'latest'), by nowe
+# wydanie autora nie zmienilo nam parametrow CLI bez zapowiedzi.
+DFN_URL = ("https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/"
+           "deep-filter-0.5.6-x86_64-pc-windows-msvc.exe")
+# Silero VAD (MIT, 2.3 MB) - guard mowy: chroni glos LUDZKI I SYNTETYCZNY przed
+# wycinaniem jako "odglos". Przypiety commit, nie "master", by wydanie autora nie
+# podmienilo nam modelu bez zapowiedzi (kontrakt: wejscia input/state/sr, okno 512+64).
+VAD_URL = ("https://raw.githubusercontent.com/snakers4/silero-vad/"
+           "v6.2.1/src/silero_vad/data/silero_vad.onnx")
 MODEL = "classla/wav2vecbert2-filledPause"
+# Model EMBEDDINGOW MOWCY (CAMPPlus, 3D-Speaker, Apache-2.0, 27 MB). Sluzy funkcji
+# CHRONIONE GLOSY: user dodaje wzorzec glosu (np. czytnika ekranu), apka tam nie tnie.
+# Przypieta REWIZJA (nie "main"), by autor nie podmienil modelu bez zapowiedzi.
+# Kontrakt: wejscie [batch, time, 80] fbank, wyjscie [batch, 192].
+SPK_URL = ("https://huggingface.co/welcomyou/campplus-3dspeaker-200k-onnx/resolve/"
+           "6265ff7af2a104d745b4389026ed9815c6c1c6ff/campplus_cn_en_common_200k.onnx")
+SPK_SHA256 = "dd1740aa1e1ffa3895f96aef2166b8af2bb2ad09c00769dd275ee36aef6a2a7f"
+
 # Model wykrywania MUZYKI (AST/AudioSet). Sluzy do CHRONIENIA fragmentow z muzyka:
 # worker nie wycina fillerow/pauz tam, gdzie gra muzyka. ~350 MB (safetensors).
 # Dociagany NIEZALEZNIE od RUNTIME_VER (istniejace instalacje dostana go bez
@@ -86,6 +113,10 @@ def _paths():
         "ready": os.path.join(root, "runtime", "READY"),
         "uv": os.path.join(root, "tools", "uv.exe"),
         "ffmpeg": os.path.join(root, "tools", "ffmpeg.exe"),
+        "dfn": os.path.join(root, "tools", "deep-filter.exe"),  # odszumianie (opcjonalne)
+        "vad": os.path.join(root, "model", "silero_vad.onnx"),  # guard mowy (Silero VAD)
+        # wzorce glosow do OCHRONY (czytnik ekranu): CAMPPlus 27 MB, Apache-2.0
+        "spk": os.path.join(root, "model", "campplus.onnx"),
         "vpy": os.path.join(root, "runtime", "venv", "Scripts", "python.exe"),
     }
 
@@ -102,11 +133,12 @@ def _has_nvidia():
             pass
     return False
 
-def _download(url, dest, desc, base_pct, span_pct):
+def _download(url, dest, desc, base_pct, span_pct, sha256=None):
     blog(f"pobieranie: {desc}")
     ctx = ssl.create_default_context()
     tmp = dest + ".part"
     req = urllib.request.Request(url, headers={"User-Agent": "Czysciciel/1.0"})
+    h = hashlib.sha256() if sha256 else None
     with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
         total = int(resp.headers.get("Content-Length", 0))
         got = 0; chunk = 1024*256; last = 0
@@ -115,11 +147,18 @@ def _download(url, dest, desc, base_pct, span_pct):
                 b = resp.read(chunk)
                 if not b: break
                 f.write(b); got += len(b)
+                if h: h.update(b)
                 if total:
                     p = base_pct + span_pct*got/total
                     if time.time()-last > 0.5:
                         boot(p, f"{desc}: {got//(1024*1024)}/{total//(1024*1024)} MB")
                         last = time.time()
+    # WERYFIKACJA INTEGRALNOSCI: model z sieci ladujemy do pipeline'u uzytkownika, wiec
+    # podmieniony/uciety plik musi byc odrzucony, nie uzyty. Bez tego cichy blad ONNX
+    # albo - gorzej - inny model o tym samym interfejsie.
+    if h and h.hexdigest() != sha256:
+        os.remove(tmp)
+        raise RuntimeError(f"{desc}: zla suma kontrolna (plik uszkodzony lub podmieniony)")
     os.replace(tmp, dest)
     blog(f"pobrano: {desc} ({os.path.getsize(dest)//(1024*1024)} MB)")
 
@@ -167,6 +206,12 @@ def cleanup_stale(P):
     _rmtree(os.path.join(P["runtime"], "hf_cache"), "stary cache w runtime")
     _rmtree(P["model"], "stary model (odtworzony bez zbednych plikow)")
     _rmtree(P["music_model"], "stary model muzyki (odtworzony)")
+    # deep-filter.exe: kasujemy, by bump wersji przyniosl swiezy build (jest maly)
+    try:
+        if os.path.exists(P["dfn"]):
+            os.remove(P["dfn"]); blog("usunieto stary modul odszumiania (zostanie pobrany na nowo)")
+    except Exception:
+        pass
 
 def cleanup_uv_cache(P):
     """uv_cache to tylko cache POBIERANIA paczek (~kilka GB przy torch). Do
@@ -214,6 +259,112 @@ def maybe_update_model(P, env):
         open(chk, "w").write(str(int(time.time())))
     except Exception:
         pass
+
+def ensure_denoiser(P):
+    """Dociaga deep-filter.exe (DeepFilterNet3, odszumianie) - JEDEN samodzielny plik,
+    bez zaleznosci Pythona (pakiet pip nie ma wheela dla 3.12, wiec pip probowalby
+    kompilowac Rusta). Wzorzec jak ffmpeg/uv: pobierz exe do tools/.
+    NIEZALEZNE od RUNTIME_VER (jak ensure_music_model) - istniejace instalacje dostaja
+    go przy najblizszym starcie bez przebudowy srodowiska. Idempotentne.
+    Brak sieci/blad = cicha rezygnacja; worker sam pomija odszumianie."""
+    if os.path.exists(P["dfn"]):
+        return
+    boot(88, "Pobieranie modułu odszumiania (~27 MB)...")
+    try:
+        _download(DFN_URL, P["dfn"], "moduł odszumiania (DeepFilterNet)", 88, 3)
+    except Exception as e:
+        # nie przerywamy startu - odszumianie to opcja domyslnie wylaczona
+        blog(f"pobieranie modulu odszumiania pominiete ({e!r}) - opcja bedzie nieaktywna")
+        try:
+            if os.path.exists(P["dfn"]): os.remove(P["dfn"])
+        except Exception:
+            pass
+
+TRENINGOWE = ("optimizer.pt", "scheduler.pt", "rng_state.pth",
+              "trainer_state.json", "training_args.bin")
+
+def cleanup_training_files(P):
+    """Usuwa pliki TRENINGOWE modelu, zbedne do inferencji. Nowe instalacje ich nie
+    pobieraja (allow_patterns w ensure_model), ale instalacje sprzed tej poprawki maja
+    je na dysku - u Michala samo optimizer.pt to 4.4 GB przy 2.2 GB realnego modelu.
+    Idempotentne, ciche przy bledzie (to tylko odzyskanie miejsca, nie funkcja)."""
+    wolne = 0
+    for nm in TRENINGOWE:
+        p = os.path.join(P["model"], nm)
+        try:
+            if os.path.exists(p):
+                wolne += os.path.getsize(p)
+                os.remove(p)
+        except Exception:
+            pass
+    if wolne:
+        blog(f"usunieto zbedne pliki treningowe modelu: {wolne/1024/1024/1024:.1f} GB odzyskane")
+
+def ensure_vad(P):
+    """Dociaga model Silero VAD (2.3 MB ONNX, MIT) ORAZ - jesli brakuje - biblioteke
+    onnxruntime. Guard mowy chroni glos (takze SYNTETYCZNY) przed wycinaniem jako
+    "odglos". Wzorzec jak ensure_denoiser: NIEZALEZNY od RUNTIME_VER, idempotentny,
+    blad = cicha rezygnacja (worker sam pomija guard).
+    DOINSTALOWANIE onnxruntime jest KONIECZNE: istniejace instalacje maja juz gotowe
+    venv i bez bumpu RUNTIME_VER (=~6 GB ponownego pobierania torcha) nie dostalyby
+    nowego pakietu z PKGS_COMMON - guard po cichu by sie nie wlaczal.
+    UWAGA: NIE instalowac pakietu pip `silero-vad` - dociaga torchaudio 2.11, ktore
+    ZAWIESZA `import torch` w tym venv (apka ma torch 2.7.0+cu128). Czysty ONNX."""
+    if not os.path.exists(P["vad"]):
+        boot(89, "Pobieranie modelu wykrywania mowy (~2 MB)...")
+        try:
+            _download(VAD_URL, P["vad"], "model wykrywania mowy (Silero VAD)", 89, 1)
+        except Exception as e:
+            blog(f"pobieranie modelu VAD pominiete ({e!r}) - guard mowy bedzie nieaktywny")
+            try:
+                if os.path.exists(P["vad"]): os.remove(P["vad"])
+            except Exception:
+                pass
+            return
+    # onnxruntime moze nie byc w istniejacym venv (instalacja sprzed tej funkcji)
+    try:
+        r = subprocess.run([P["vpy"], "-c", "import onnxruntime"],
+                           capture_output=True, **_win_kw())
+        if r.returncode != 0:
+            boot(90, "Instalacja biblioteki wykrywania mowy...")
+            _run([P["uv"], "pip", "install", "--python", P["vpy"], "onnxruntime==1.28.0"],
+                 "instalacja onnxruntime (guard mowy)")
+    except Exception as e:
+        blog(f"instalacja onnxruntime pominieta ({e!r}) - guard mowy bedzie nieaktywny")
+
+def ensure_spk(P):
+    """Dociaga model embeddingow mowcy (CAMPPlus, 27 MB, Apache-2.0) + biblioteke
+    kaldi_native_fbank. Sluzy funkcji CHRONIONE GLOSY: user dodaje wzorzec glosu
+    (np. czytnika ekranu), a apka nie tnie tam nic.
+    DLACZEGO ten model: automatyczne wykrywanie syntezy jest NIEWYKONALNE (7 podejsc
+    zmierzonych i obalonych - szczegoly w komentarzu SPK_* w worker.py). Dziala tylko
+    nadzorowane "znajdz TEN glos", a do tego CAMPPlus jest trenowany (rozni mowcy 0.21,
+    ten sam 0.46-0.54). BEZ torchaudio - czysty onnxruntime + fbank.
+    Wzorzec jak ensure_vad: NIEZALEZNY od RUNTIME_VER (istniejace instalacje dostaja to
+    przy najblizszym starcie), idempotentny, blad = cicha rezygnacja (funkcja nieaktywna,
+    reszta apki dziala)."""
+    if not os.path.exists(P["spk"]):
+        boot(91, "Pobieranie modelu rozpoznawania glosow (~27 MB)...")
+        try:
+            _download(SPK_URL, P["spk"], "model rozpoznawania glosow (CAMPPlus)", 91, 1,
+                      sha256=SPK_SHA256)
+        except Exception as e:
+            blog(f"pobieranie modelu glosow pominiete ({e!r}) - ochrona glosow nieaktywna")
+            try:
+                if os.path.exists(P["spk"]): os.remove(P["spk"])
+            except Exception:
+                pass
+            return
+    # kaldi_native_fbank: cechy wejsciowe modelu (80 pasm). Osobna, mala paczka.
+    try:
+        r = subprocess.run([P["vpy"], "-c", "import kaldi_native_fbank"],
+                           capture_output=True, **_win_kw())
+        if r.returncode != 0:
+            boot(92, "Instalacja biblioteki rozpoznawania glosow...")
+            _run([P["uv"], "pip", "install", "--python", P["vpy"],
+                  "kaldi_native_fbank==1.22.3"], "instalacja kaldi_native_fbank")
+    except Exception as e:
+        blog(f"instalacja kaldi_native_fbank pominieta ({e!r}) - ochrona glosow nieaktywna")
 
 def ensure_music_model(P, env):
     """Dociaga model wykrywania MUZYKI (AST) do PLASKIEGO katalogu music_model, jesli
@@ -278,6 +429,10 @@ def ensure(force_device=None):
                 env["VIRTUAL_ENV"] = P["venv"]
                 # dociagnij model muzyki, jesli to instalacja sprzed tej funkcji
                 ensure_music_model(P, env)
+                ensure_denoiser(P)          # j.w. dla modulu odszumiania
+                ensure_vad(P)               # j.w. dla modelu VAD (guard mowy)
+                ensure_spk(P)               # j.w. dla modelu glosow (chronione glosy)
+                cleanup_training_files(P)   # odzyskaj miejsce po plikach treningowych
                 maybe_update_model(P, env)
                 boot(100, "Srodowisko gotowe")
                 return P["vpy"], P["ffmpeg"]
@@ -373,6 +528,14 @@ def ensure(force_device=None):
 
     # 6b. model wykrywania MUZYKI (AST, ~350 MB) - do plaskiego katalogu music_model
     ensure_music_model(P, env)
+    # 6c. modul odszumiania (deep-filter.exe, ~27 MB) - opcja, ale dociagamy od razu,
+    # by user mogl ja wlaczyc bez czekania na kolejny start
+    ensure_denoiser(P)
+    # 6d. model VAD (Silero, ~2 MB) - guard mowy, zawsze aktywny (nie jest opcja)
+    ensure_vad(P)
+    # 6e. model glosow (CAMPPlus, ~27 MB) - funkcja CHRONIONE GLOSY (wzorce od usera)
+    ensure_spk(P)
+    cleanup_training_files(P)   # gdyby repo modelu jednak podrzucilo pliki treningowe
     boot(98, "Modele pobrane")
 
     # marker gotowosci
