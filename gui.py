@@ -15,7 +15,7 @@ Funkcje:
   - pasek postepu + dziennik czytany przez czytnik ekranu,
   - otwarcie folderu z wynikiem.
 """
-import os, sys, threading, subprocess, queue, time
+import os, sys, threading, subprocess, queue, time, json
 import wx
 
 APP_NAME = "Czysciciel"          # klucz techniczny: nazwa exe i folderu %LOCALAPPDATA% (bez ogonka)
@@ -50,6 +50,22 @@ EKSPORTY = [
     ("oba",    "Audio i projekt Reapera"),
 ]
 BITRATE_LISTA = [64, 96, 128, 160, 192, 224, 256, 320]
+# Poziomy glosnosci docelowej. WAZNE: -23 to NORMA (EBU R128), -16/-14 to poziomy
+# odtwarzania platform - opisy musza to rozrozniac, by nie wprowadzac usera w blad.
+LUFS_WARTOSCI = ["-16", "-23", "-14"]
+LUFS_OPISY = [
+    "-16 LUFS - podcast (Apple)",
+    "-23 LUFS - norma EBU R128 (radio, TV)",
+    "-14 LUFS - Spotify",
+]
+# Sila odszumiania. Domyslnie DELIKATNIE: zmierzone, ze mocniejsze ustawienia kupuja
+# marne 2.5 dB cichszego tla za 13.7 dB glebszej ingerencji w glos.
+ODSZUM_WARTOSCI = [6, 12, 100]
+ODSZUM_OPISY = [
+    "delikatnie (zalecane)",
+    "średnio",
+    "mocno",
+]
 WARIANTY_RPP = [
     ("gotowy",      "Gotowy: fragmenty już wycięte i dosunięte"),
     ("przejrzenie", "Do przejrzenia: fragmenty oznaczone „WYTNIJ” (ripple)"),
@@ -268,6 +284,77 @@ class MainFrame(wx.Frame):
         self.cb_mlask.SetName("Wycinaj mlaśnięcia, cmoknięcia i kliknięcia ustne")
         root.Add(self.cb_mlask, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
+        # --- CHRONIONE GLOSY (wzorce mowcy) ---
+        # Automatyczne wykrywanie mowy syntetycznej jest NIEWYKONALNE (7 podejsc
+        # zmierzonych i obalonych - patrz komentarz SPK_* w worker.py). Dziala tylko
+        # nadzorowane "znajdz TEN glos": user dodaje probki glosow, ktore maja byc
+        # nietkniete (np. czytnik ekranu w audycji o czytnikach). Michal: "wyciecie
+        # 1-2 glosow syntetycznych to i tak mniej roboty niz ciecie pliku".
+        box_gl = wx.StaticBox(panel, label="Chronione głosy (nie wycinaj z nich niczego)")
+        sb_gl = wx.StaticBoxSizer(box_gl, wx.VERTICAL)
+        lbl_gl = wx.StaticText(panel, label=
+            "Dodaj próbkę głosu (np. czytnika ekranu), który ma zostać nietknięty. "
+            "Wzorce działają też w kolejnych sesjach.")
+        sb_gl.Add(lbl_gl, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+        # ListBox, nie ListCtrl: czytniki ekranu czytaja go bez dodatkowych zabiegow,
+        # a lista jest jednokolumnowa (nazwa + spojnosc w jednym wierszu).
+        self.lst_glosy = wx.ListBox(panel, size=(-1, 90), style=wx.LB_SINGLE)
+        self.lst_glosy.SetName("Lista chronionych głosów")
+        sb_gl.Add(self.lst_glosy, 1, wx.EXPAND | wx.ALL, 6)
+        rg = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_gl_add = wx.Button(panel, label="Dodaj &głos z pliku...")
+        self.btn_gl_add.SetName("Dodaj chroniony głos z pliku audio")
+        rg.Add(self.btn_gl_add, 0, wx.RIGHT, 6)
+        self.btn_gl_del = wx.Button(panel, label="&Usuń głos")
+        self.btn_gl_del.SetName("Usuń zaznaczony chroniony głos")
+        rg.Add(self.btn_gl_del, 0)
+        sb_gl.Add(rg, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        root.Add(sb_gl, 0, wx.EXPAND | wx.ALL, 8)
+        self.btn_gl_add.Bind(wx.EVT_BUTTON, self.on_glos_add)
+        self.btn_gl_del.Bind(wx.EVT_BUTTON, self.on_glos_del)
+        self.glosy = []          # [{"nazwa":str,"wektor":[float],"spojnosc":float}]
+        # stan poczatkowy: pusta lista => "Usun" nieaktywny (inaczej czytnik oglasza
+        # aktywny przycisk, ktory nic nie robi). _load_settings wola to ponownie.
+        self._glosy_odswiez()
+
+        # --- OBROBKA DZWIEKU (opcjonalna, domyslnie WYLACZONA) ---
+        # Obie funkcje ingeruja w brzmienie, wiec swiadomie startuja jako OFF.
+        box_ob = wx.StaticBox(panel, label="Obróbka dźwięku (opcjonalna)")
+        sb_ob = wx.StaticBoxSizer(box_ob, wx.VERTICAL)
+
+        self.cb_norm = wx.CheckBox(panel, label="&Wyrównaj głośność (LUFS)")
+        self.cb_norm.SetName("Wyrównaj głośność nagrania do wybranego poziomu. "
+                             "Nie zmienia dynamiki - stałe wzmocnienie plus zabezpieczenie szczytów")
+        sb_ob.Add(self.cb_norm, 0, wx.ALL, 4)
+        r_lufs = wx.BoxSizer(wx.HORIZONTAL)
+        self.lbl_lufs = wx.StaticText(panel, label="&Poziom docelowy:")
+        r_lufs.Add(self.lbl_lufs, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.ch_lufs = wx.Choice(panel, choices=LUFS_OPISY)
+        self.ch_lufs.SetSelection(0)
+        self.ch_lufs.SetName("Poziom docelowy głośności")
+        r_lufs.Add(self.ch_lufs, 0, wx.ALIGN_CENTER_VERTICAL)
+        sb_ob.Add(r_lufs, 0, wx.LEFT | wx.BOTTOM, 20)
+
+        self.cb_odszum = wx.CheckBox(panel, label="&Odszum nagranie")
+        self.cb_odszum.SetName("Odszum nagranie modelem DeepFilterNet. Przydatne przy nagraniach "
+                               "zdalnych. Na czystym nagraniu studyjnym nie jest potrzebne")
+        sb_ob.Add(self.cb_odszum, 0, wx.ALL, 4)
+        r_ods = wx.BoxSizer(wx.HORIZONTAL)
+        self.lbl_odszum = wx.StaticText(panel, label="Siła odszu&miania:")
+        r_ods.Add(self.lbl_odszum, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.ch_odszum = wx.Choice(panel, choices=ODSZUM_OPISY)
+        self.ch_odszum.SetSelection(0)
+        self.ch_odszum.SetName("Siła odszumiania. Delikatnie jest zalecane - mocniejsze ustawienia "
+                               "bardziej ingerują w głos")
+        r_ods.Add(self.ch_odszum, 0, wx.ALIGN_CENTER_VERTICAL)
+        sb_ob.Add(r_ods, 0, wx.LEFT | wx.BOTTOM, 20)
+        root.Add(sb_ob, 0, wx.EXPAND | wx.ALL, 8)
+
+        self.cb_norm.Bind(wx.EVT_CHECKBOX, self.on_norm_toggle)
+        self.cb_odszum.Bind(wx.EVT_CHECKBOX, self.on_odszum_toggle)
+        self.on_norm_toggle(None)
+        self.on_odszum_toggle(None)
+
         # --- folder wyjsciowy ---
         r3 = wx.BoxSizer(wx.HORIZONTAL)
         lbl_out = wx.StaticText(panel, label="Folder &wyjściowy:")
@@ -445,6 +532,18 @@ class MainFrame(wx.Frame):
         for c in (self.sl_muzyka, self.lbl_prog, self.lbl_prog_val):
             c.Enable(on)
 
+    def on_norm_toggle(self, evt):
+        """Wybor poziomu LUFS aktywny tylko gdy normalizacja wlaczona."""
+        on = self.cb_norm.GetValue()
+        for c in (self.ch_lufs, self.lbl_lufs):
+            c.Enable(on)
+
+    def on_odszum_toggle(self, evt):
+        """Wybor sily odszumiania aktywny tylko gdy odszumianie wlaczone."""
+        on = self.cb_odszum.GetValue()
+        for c in (self.ch_odszum, self.lbl_odszum):
+            c.Enable(on)
+
     def on_eksport_change(self, evt):
         """Ustawienia audio widoczne gdy powstaje audio; wariant RPP - gdy powstaje reaper."""
         eksport = EKSPORTY[self.rb_eksport.GetSelection()][0]
@@ -473,6 +572,108 @@ class MainFrame(wx.Frame):
             "Środowisko instaluje się raz przy pierwszym uruchomieniu.",
             "O programie", wx.OK | wx.ICON_INFORMATION)
 
+    # ---------------- chronione glosy ----------------
+    def _glosy_odswiez(self):
+        """Przerysuj liste. Spojnosc pokazujemy JAWNIE - zla probka (kilka glosow albo
+        cisza) daje bezuzyteczny wzorzec, a user musi to widziec, nie zgadywac.
+        Zmierzone: probka czystej syntezy 0.653, probka z domieszka innego glosu 0.440."""
+        self.lst_glosy.Clear()
+        for g in self.glosy:
+            sp = g.get("spojnosc", 0.0)
+            ost = "" if sp >= 0.6 else "  (słaba próbka - może zawierać inny głos)"
+            self.lst_glosy.Append(f"{g['nazwa']} - jakość {sp:.2f}{ost}")
+        self.btn_gl_del.Enable(bool(self.glosy))
+
+    def on_glos_add(self, _evt):
+        """Dodaj wzorzec z DOWOLNEGO formatu audio - dekodowanie ffmpegiem do PCM
+        (jak reszta wejsc apki), wiec mp3/flac/m4a/ogg/wav dzialaja tak samo."""
+        dlg = wx.FileDialog(self, "Wybierz próbkę głosu do ochrony",
+                            wildcard=("Pliki audio|*.mp3;*.wav;*.flac;*.m4a;*.aac;*.ogg;"
+                                      "*.opus;*.wma;*.mp4;*.mkv|Wszystkie pliki|*.*"),
+                            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST)
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy(); return
+        src = dlg.GetPath()
+        dlg.Destroy()
+        # liczenie embeddingu w WATKU - inaczej GUI zamarza (i czytnik milczy)
+        self.btn_gl_add.Enable(False)
+        self.set_status("Analizuję próbkę głosu...")
+        threading.Thread(target=self._glos_worker, args=(src,), daemon=True).start()
+
+    def _glos_worker(self, src):
+        """Liczy wzorzec w osobnym PROCESIE (worker.py --wzorzec) - model glosow zyje
+        w venv runtime, ktorego GUI (PyInstaller) nie ma we wlasnym interpreterze.
+        Srodowisko ustawiane jak w _run_worker, inaczej worker nie znajdzie modelu."""
+        try:
+            vpy, ff = self._ensure_runtime()
+            if not vpy:
+                raise RuntimeError("środowisko nie jest gotowe")
+            root = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                                APP_NAME)
+            env = os.environ.copy()
+            env["FFMPEG_BIN"] = ff
+            env["SPK_MODEL"] = os.path.join(root, "model", "campplus.onnx")
+            env["CZYSCICIEL_MODEL_DIR"] = os.path.join(root, "model")
+            r = subprocess.run([vpy, helper_script("worker.py"), "--wzorzec", src],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=300, env=env,
+                               creationflags=self._no_window())
+            wek, spoj, err = None, 0.0, ""
+            for ln in ((r.stdout or "") + (r.stderr or "")).splitlines():
+                if ln.startswith("WZORZEC|"):
+                    d = json.loads(ln[8:])
+                    wek, spoj = d.get("wektor"), float(d.get("spojnosc", 0.0))
+                elif ln.startswith("LOG|"):
+                    err = ln[4:]
+            if not wek:
+                raise RuntimeError(err or "nie udało się policzyć wzorca głosu")
+            wx.CallAfter(self._glos_gotowy, os.path.basename(src), wek, spoj)
+        except Exception as e:
+            wx.CallAfter(self._glos_blad, str(e))
+
+    def _glos_gotowy(self, nazwa, wektor, spojnosc):
+        self.glosy.append({"nazwa": nazwa, "wektor": wektor, "spojnosc": spojnosc})
+        self._glosy_odswiez()
+        self._save_settings()
+        self.btn_gl_add.Enable(True)
+        self.set_status(f"Dodano chroniony głos: {nazwa} (jakość {spojnosc:.2f})")
+        # focus na liste - user od razu slyszy, co dodal
+        self.lst_glosy.SetSelection(len(self.glosy) - 1)
+        self.lst_glosy.SetFocus()
+
+    def _glos_blad(self, msg):
+        self.btn_gl_add.Enable(True)
+        self.set_status("Nie udało się dodać głosu")
+        wx.MessageBox(f"Nie udało się przygotować wzorca głosu.\n\n{msg}\n\n"
+                      "Wskazówka: próbka powinna zawierać co najmniej 4-5 sekund "
+                      "samej mowy tego głosu, bez muzyki i bez innych osób.",
+                      "Chronione głosy", wx.OK | wx.ICON_WARNING)
+
+    def on_glos_del(self, _evt):
+        i = self.lst_glosy.GetSelection()
+        if i == wx.NOT_FOUND:
+            return
+        nazwa = self.glosy[i]["nazwa"]
+        del self.glosy[i]
+        self._glosy_odswiez()
+        self._save_settings()
+        self.set_status(f"Usunięto chroniony głos: {nazwa}")
+        if self.glosy:
+            self.lst_glosy.SetSelection(min(i, len(self.glosy) - 1))
+        self.lst_glosy.SetFocus()
+
+    def _zapisz_glosy_tmp(self):
+        """Wzorce do pliku JSON dla workera (wektory sa za dlugie na argv)."""
+        if not self.glosy:
+            return ""
+        p = os.path.join(runtime_root(), "chronione_glosy.json")
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"wzorce": self.glosy}, f)
+            return p
+        except Exception:
+            return ""
+
     # ---------------- persystencja ustawien ----------------
     def _settings_path(self):
         return os.path.join(runtime_root(), "settings.json")
@@ -497,7 +698,14 @@ class MainFrame(wx.Frame):
             "tnij_chrzak": self.cb_chrzak.GetValue(),
             "tnij_oddech": self.cb_oddech.GetValue(),
             "tnij_mlask": self.cb_mlask.GetValue(),
+            "normalizuj": self.cb_norm.GetValue(),
+            "lufs": self.ch_lufs.GetSelection(),
+            "odszum": self.cb_odszum.GetValue(),
+            "odszum_sila": self.ch_odszum.GetSelection(),
             "outdir": self.txt_out.GetValue().strip(),
+            # CHRONIONE GLOSY: wzorce zapamietane miedzy sesjami - glos czytnika jest
+            # zawsze ten sam, wiec raz dodany dziala na kolejne odcinki.
+            "glosy": self.glosy,
         }
 
     def _save_settings(self):
@@ -540,6 +748,22 @@ class MainFrame(wx.Frame):
         _val(self.cb_chrzak, "tnij_chrzak", bool)
         _val(self.cb_oddech, "tnij_oddech", bool)
         _val(self.cb_mlask, "tnij_mlask", bool)
+        # CHRONIONE GLOSY: kazdy wzorzec sprawdzany osobno - uszkodzony wpis nie moze
+        # wywalic wczytywania calej listy ani ustawien.
+        self.glosy = []
+        for g in (s.get("glosy") or []):
+            try:
+                v = [float(x) for x in (g.get("wektor") or [])]
+                if len(v) >= 64 and g.get("nazwa"):
+                    self.glosy.append({"nazwa": str(g["nazwa"]), "wektor": v,
+                                       "spojnosc": float(g.get("spojnosc", 0.0))})
+            except Exception:
+                continue
+        self._glosy_odswiez()
+        _val(self.cb_norm, "normalizuj", bool)
+        _sel(self.ch_lufs, "lufs", len(LUFS_WARTOSCI))
+        _val(self.cb_odszum, "odszum", bool)
+        _sel(self.ch_odszum, "odszum_sila", len(ODSZUM_WARTOSCI))
         outdir = s.get("outdir")
         if isinstance(outdir, str) and outdir:
             self.txt_out.SetValue(outdir)
@@ -547,6 +771,8 @@ class MainFrame(wx.Frame):
         self.on_format_change(None)
         self.on_eksport_change(None)
         self.on_muzyka_toggle(None)
+        self.on_norm_toggle(None)
+        self.on_odszum_toggle(None)
 
     # ---------------- uruchomienie ----------------
     def _set_running(self, running):
@@ -555,12 +781,15 @@ class MainFrame(wx.Frame):
                   self.rb_tryb, self.rb_eksport, self.ch_format, self.ch_kanaly,
                   self.ch_bitrate, self.cb_wyciete, self.cb_muzyka, self.sl_muzyka,
                   self.rb_wariant, self.sc_workers, self.cb_dokladny,
-                  self.cb_chrzak, self.cb_oddech, self.cb_mlask):
+                  self.cb_chrzak, self.cb_oddech, self.cb_mlask,
+                  self.cb_norm, self.ch_lufs, self.cb_odszum, self.ch_odszum):
             b.Enable(not running)
         if not running:
             self.on_format_change(None)   # przywroc poprawny stan bitrate
             self.on_eksport_change(None)  # przywroc widocznosc/aktywnosc opcji audio
             self.on_muzyka_toggle(None)   # suwak progu wg stanu checkboxa muzyki
+            self.on_norm_toggle(None)     # lista LUFS wg stanu checkboxa normalizacji
+            self.on_odszum_toggle(None)   # lista sily wg stanu checkboxa odszumiania
         self.btn_stop.Enable(running)
 
     def on_start(self, evt):
@@ -589,12 +818,18 @@ class MainFrame(wx.Frame):
         tnij_chrzak = self.cb_chrzak.GetValue()
         tnij_oddech = self.cb_oddech.GetValue()
         tnij_mlask = self.cb_mlask.GetValue()
+        normalizuj = self.cb_norm.GetValue()
+        lufs = LUFS_WARTOSCI[self.ch_lufs.GetSelection()]
+        odszum = self.cb_odszum.GetValue()
+        odszum_sila = ODSZUM_WARTOSCI[self.ch_odszum.GetSelection()]
         opts = dict(preset=preset, minf=minf, tryb=tryb, eksport=eksport,
                     fmt=fmt, bitrate=bitrate, kanaly=kanaly, outdir=outdir,
                     zapisz_wyciete=zapisz_wyciete, wariant_rpp=wariant_rpp,
                     omijaj_muzyke=omijaj_muzyke, prog_muzyki=prog_muzyki, workers=workers,
                     dokladny=dokladny, tnij_chrzak=tnij_chrzak, tnij_oddech=tnij_oddech,
-                    tnij_mlask=tnij_mlask)
+                    tnij_mlask=tnij_mlask, normalizuj=normalizuj, lufs=lufs,
+                    odszum=odszum, odszum_sila=odszum_sila,
+                    glosy_json=self._zapisz_glosy_tmp())
         self.stop_flag.clear()
         self._set_running(True)
         self.gauge.SetValue(0)
@@ -737,6 +972,9 @@ class MainFrame(wx.Frame):
         env["HF_HOME"] = os.path.join(root, "hf_cache")
         env["CZYSCICIEL_MODEL_DIR"] = os.path.join(root, "model")  # plaski katalog modelu
         env["CZYSCICIEL_MUSIC_MODEL_DIR"] = os.path.join(root, "music_model")  # model muzyki (AST)
+        env["DFN_BIN"] = os.path.join(root, "tools", "deep-filter.exe")  # odszumianie (opcjonalne)
+        env["VAD_MODEL"] = os.path.join(root, "model", "silero_vad.onnx")  # guard mowy (Silero)
+        env["SPK_MODEL"] = os.path.join(root, "model", "campplus.onnx")  # chronione glosy (CAMPPlus)
         args = [vpy, helper_script("worker.py"), fin, fout,
                 "-p", opts["preset"],
                 "--min-filler", f"{opts['minf']}",
@@ -761,6 +999,14 @@ class MainFrame(wx.Frame):
             args.append("--tnij-oddechy")
         if opts.get("tnij_mlask"):
             args.append("--tnij-mlasniecia")
+        # obrobka dzwieku (obie opcje domyslnie wylaczone)
+        if opts.get("odszum"):
+            args += ["--odszum", "--odszum-sila", f"{opts.get('odszum_sila', 6)}"]
+        if opts.get("normalizuj"):
+            args += ["--normalizuj", "--lufs", opts.get("lufs", "-16")]
+        # CHRONIONE GLOSY: sciezka do JSON z wzorcami (wektory za dlugie na argv)
+        if opts.get("glosy_json"):
+            args += ["--chronione-glosy", opts["glosy_json"]]
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", env=env,
                                 creationflags=self._no_window())
