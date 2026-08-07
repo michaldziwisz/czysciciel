@@ -25,3 +25,13 @@ ciecia_*.json
 # Srodowiska
 .venv/
 venv/
+
+# katalog badawczy (pomiary DFN/LUFS) + zrzuty kontrolne - NIE do repo
+_dfn_test/
+_gui_kontrolki.txt
+_hermes_verify_*.py
+# modele i venv-y pobierane na czas badan (setki MB) - NIE do repo
+_spk_model/
+_silvenv/
+# paczka release: buduje ja CI (build.yml) i wrzuca do Release - NIE do repo
+Czysciciel-windows.zip

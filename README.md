@@ -23,6 +23,12 @@ Program jest w pełni obsługiwany z klawiatury i przez czytniki ekranu
   liczby kanałów (mono / stereo / jak w źródle).
 - **Eksportuje projekt Reapera (.RPP)** — jeśli chcesz dalej edytować materiał
   ręcznie, dostajesz gotowy, niedestrukcyjny projekt z zaznaczonymi cięciami.
+- **Chroni wskazane głosy przed cięciem** — jeśli w nagraniu pojawia się mowa
+  syntetyczna (np. czytnik ekranu) albo inny głos, którego program nie powinien
+  ruszać, dodajesz jego krótką próbkę do listy „Chronione głosy". Program
+  rozpoznaje ten głos w nagraniu i blokuje w tych miejscach wszystkie cięcia.
+  Wzorców może być wiele (różne syntezatory to różne głosy) i zostają
+  zapamiętane między sesjami.
 - **Wybiera GPU albo procesor automatycznie** — na komputerze z kartą NVIDIA
   liczy szybciej, bez karty też zadziała.
 
@@ -136,10 +142,16 @@ Wystarczy otworzyć plik `.RPP` w [Reaperze](https://www.reaper.fm/).
    transkrypcja w ogóle nie zapisuje.
 2. **Wykrycie pauz.** Program mierzy poziom głośności i znajduje zbyt długie
    ciche fragmenty.
-3. **Cięcie.** Wycinane fragmenty są usuwane płynnie (z delikatnym
+3. **Ochrona wskazanych głosów.** Jeśli dodałeś wzorce, program liczy „odcisk
+   głosu" (model CAMPPlus) w oknach po 2 sekundy, przesuwanych co pół sekundy,
+   i porównuje je z wzorcami. Miejsca podobne do któregokolwiek wzorca są
+   wyłączane z cięcia — łącznie z pauzami i fillerami. Porównanie odejmuje
+   wcześniej charakterystykę toru nagrania, dzięki czemu mierzy sam głos,
+   a nie mikrofon czy pogłos pomieszczenia.
+4. **Cięcie.** Wycinane fragmenty są usuwane płynnie (z delikatnym
    przenikaniem na łączeniach i marginesem bezpieczeństwa od granic słów), więc
    nie słychać „przeskoków". Cała operacja zachowuje pełną jakość dźwięku.
-4. **Zapis** w wybranym formacie oraz — opcjonalnie — projekt Reapera.
+5. **Zapis** w wybranym formacie oraz — opcjonalnie — projekt Reapera.
 
 ---
 

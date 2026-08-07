@@ -40,13 +40,31 @@ Komponenty pobierane przy pierwszym uruchomieniu do
    Licencja: Apache-2.0 / MIT
    Źródło: https://github.com/astral-sh/uv
 
+9. Silero VAD (model wykrywania mowy, ONNX)
+   Licencja: MIT
+   Źródło: https://github.com/snakers4/silero-vad
+
+10. Model embeddingów mówcy CAMPPlus (3D-Speaker, ONNX) - funkcja
+    "Chronione głosy"
+    Licencja: Apache License 2.0
+    Źródło: https://huggingface.co/welcomyou/campplus-3dspeaker-200k-onnx
+    Model bazowy: https://github.com/modelscope/3D-Speaker
+
+11. onnxruntime (uruchamianie modeli ONNX)
+    Licencja: MIT
+    Źródło: https://github.com/microsoft/onnxruntime
+
+12. kaldi-native-fbank (cechy fbank dla modelu głosów)
+    Licencja: Apache License 2.0
+    Źródło: https://github.com/csukuangfj/kaldi-native-fbank
+
 Komponenty użyte do zbudowania launchera:
 
-9. wxPython
-   Licencja: wxWindows Library Licence (liberalna, oparta na LGPL)
-   Źródło: https://wxpython.org
+13. wxPython
+    Licencja: wxWindows Library Licence (liberalna, oparta na LGPL)
+    Źródło: https://wxpython.org
 
-10. PyInstaller
+14. PyInstaller
     Licencja: GPL-2.0 z wyjątkiem pozwalającym na dystrybucję
     zbudowanych aplikacji pod dowolną licencją.
     Źródło: https://pyinstaller.org
