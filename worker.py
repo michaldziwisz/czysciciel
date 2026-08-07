@@ -23,7 +23,7 @@ Uzycie:
   python worker.py <wejscie> [wyjscie.mp3] [-p preset] [--bez-pauz]
                    [--min-filler S] [--rpp] [--zostaw-wav]
 """
-import os, sys, json, subprocess, time, bisect
+import os, re, sys, json, shutil, subprocess, time, bisect
 
 # Windows: dzieci (ffmpeg) BEZ wlasnego okna konsoli. GUI odpala worker z
 # CREATE_NO_WINDOW, ale flaga nie propaguje sie na wnuki - kazdy subprocess.run
@@ -137,6 +137,16 @@ def _ffmpeg_bin():
     return os.environ.get("FFMPEG_BIN", "ffmpeg")
 
 # --- ciezkie importy dopiero gdy liczymy ---
+def _load_light():
+    """Lekkie zaleznosci (numpy + soundfile) BEZ torcha/transformers. GUI wola
+    `wzorzec_glosu` przy dodawaniu probki glosu - nie ma po co ladowac 2 GB modeli
+    i zajmowac GPU tylko po to, zeby policzyc jeden embedding na CPU.
+    UWAGA: `import x` w bloku `if` przypisuje do LOKALNEJ nazwy nawet przy `global`
+    zadeklarowanym wyzej - dlatego importujemy bezwarunkowo (idempotentne, tanie)."""
+    global np, sf
+    import numpy as np
+    import soundfile as sf
+
 def _load_heavy():
     global np, torch, sf, librosa, pd, AutoFeatureExtractor, Wav2Vec2BertForAudioFrameClassification
     global ASTForAudioClassification
@@ -482,6 +492,342 @@ def filter_cuts_by_music(allc, music_regions):
     kept = [c for c in allc if not _in_music(c["a"], c["b"], music_regions)]
     return kept, len(allc) - len(kept)
 
+# ---------- GUARD MOWY: Silero VAD (chroni glos przed wycinaniem ODGLOSOW) ----------
+# PROBLEM (Michal, 07.08.2026): narzedzie wycinalo mowe SYNTETYCZNA (czytnik ekranu),
+# a on robi o niej materialy - to TRESC, nie zaklocenie.
+# PRZYCZYNA: model AST (AudioSet 2017) nie rozpoznaje dzisiejszego neuronowego TTS jako
+# mowy. Zmierzone: mediana p(mowa) 0.259 na TTS vs 0.542-0.575 na ludzkim glosie, 43.5%
+# okien ponizej SOUND_SPEECH_GUARD. Zamiast mowy AST widzi Gasp 0.65 / Snort 0.59 /
+# Biting 0.61 - czyli DOKLADNIE klasy wycinane jako odglosy.
+# CZEGO NIE PROBOWAC (wszystko ZMIERZONE i odrzucone):
+#  1. klasa "Speech synthesizer" w SPEECH_CLASSES: p ma mediane 0.001, max 0.138 ->
+#     niechronione okna 43.5% -> 43.5%, ZERO zmiany.
+#  2. podniesienie progu: musialby byc >=0.76, a ludzki glos ma mediane 0.542 - chronilby
+#     zwykle nagrania i apka przestalaby wycinac fillery.
+#  3. heurystyka "okno ma dzwiek, ale AST nie widzi mowy" (poprzednie detect_tts): AST jest
+#     wobec TTS NIESTABILNY (ta sama synteza: 0.020 -> 0.729 -> 0.507 w kolejnych sekundach),
+#     wiec regiony byly dziurawe i ciecia przeciskaly sie przez luki. Michal slyszal to
+#     przy 1:42, 2:55, 3:32, 3:57. Scalanie luk pomagalo tylko czesciowo.
+# ROZWIAZANIE (spostrzezenie Michala: "przeciez nie jest ani muzyka, ani cisza, bardziej
+# przypomina mowe"): uzyc DETEKTORA MOWY, nie klasyfikatora dzwiekow. Silero VAD (MIT,
+# 2.3 MB ONNX) wykrywa AKTYWNOSC MOWY niezaleznie od tego, czy ludzka czy syntetyczna.
+# Zmierzone na materiale Michala: 176 s p=0.991, 217 s p=0.992, 242 s p=0.996 - czyli
+# dokladnie tam, gdzie AST zawodzil. Na ludzkim nagraniu 91% okien. RTF 0.005 (5h23m ~
+# 1.6 min, wobec 80 min DeepFilterNet). onnxruntime NIE koliduje z torchem apki
+# (sprawdzone: torch 2.7.0+cu128 + CUDA dziala; UWAGA - pip silero-vad dociaga
+# torchaudio 2.11, ktore ZAWIESZA import torch. Dlatego czysty ONNX, bez pakietu pip).
+# ZAKRES (decyzja Michala, wariant 1): guard dotyczy TYLKO ODGLOSOW (chrzakniecia/oddechy/
+# mlasniecia). NIE fillerow - bo ZMIERZONE: Silero uznaje 76% fillerow (19/25) za mowe
+# (srednie p=0.503, mediana max 0.840), wiec guard na fillerach zablokowalby 3/4 ciec
+# i zabil podstawowa funkcje apki. Fillery zostaja przy swoim dedykowanym modelu
+# (wav2vecbert2-filledPause), ktory dziala poprawnie takze na syntezie.
+VAD_SR = 16000         # Silero v5 dziala WYLACZNIE w 16 kHz
+VAD_WIN = 512          # ...i wymaga DOKLADNIE 512 probek na okno (32 ms)
+VAD_CTX = 64           # ...ORAZ 64 probek kontekstu z poprzedniego okna, doklejanych
+                       # z przodu (OnnxWrapper.__call__: `cat([self._context, x])`).
+                       # BEZ TEGO MODEL ZWRACA ~0.000 DLA WSZYSTKIEGO, takze ludzkiej mowy -
+                       # popelnilem ten blad i omal nie uznalem, ze Silero nie dziala.
+VAD_THRESH = 0.5       # p(mowa) >= tyle => okno jest mowa (wartosc domyslna Silero)
+VAD_PAD = 0.20         # margines wokol regionu mowy (s) - chroni koncowki wypowiedzi
+VAD_MERGE_GAP = 0.35   # scal regiony mowy rozdzielone krotsza przerwa (oddech miedzy slowami)
+
+_vad_sess = None
+
+# ---------- CHRONIONE GLOSY (wzorce mowcy, CAMPPlus ONNX) ----------
+# PROBLEM: model fillerow uznaje mowe SYNTETYCZNA (czytnik ekranu) za "yyy" i ja wycina,
+# a dla Michala to TRESC audycji. Automatycznego wykrywania syntezy NIE DA SIE zrobic -
+# 7 podejsc zmierzonych i obalonych (klasa AudioSet p=0.001; koniunkcja VAD+AST 0.556 vs
+# 0.556; cechy sygnalowe AUC 0.79; model antispoof AUC 0.209 - uznawal WSZYSTKO za synteze;
+# prog pewnosci fillerow 0.950 vs 0.947; podglosnienie - ekstraktor normalizuje wejscie;
+# embeddingi mowcy bez nadzoru 0.710 vs 0.683). Szczegoly w skillu.
+# ROZWIAZANIE (pomysl Michala): user DODAJE WZORCE glosow do ochrony ("wyciecie 1-2 glosow
+# syntetycznych to i tak mniej roboty niz ciecie pliku"). Zadanie zmienia sie z
+# "rozpoznaj synteze" (niewykonalne) na "znajdz TEN glos" - a do tego CAMPPlus jest
+# trenowany. ZMIERZONE: wzorce chronia 100% swoich okien, 4.3% materialu, 0.0% obcego
+# ludzkiego nagrania. Dwa wskazane syntezatory maja podobienstwo 0.158 = rozne glosy,
+# wiec jeden wzorzec NIE wystarczy (dlatego LISTA wzorcow).
+SPK_SR = 16000         # CAMPPlus dziala w 16 kHz
+SPK_WIN = 2.0          # okno na jeden embedding (s)
+SPK_HOP = 0.5          # KROK okna. ZMIERZONE: przy kroku = SPK_WIN (bez zachodzenia)
+                       # przecieklo 20% syntezy - ciecia fillerow trwaja 0.3-1 s, wiec
+                       # krotki fragment albo lezacy na GRANICY okna dawal mieszanke
+                       # glos+synteza i podobienstwo spadalo pod prog. Krok 0.5 s dal
+                       # 29 trafien vs 8 na tym samym materiale (3.6x).
+SPK_MEL = 80           # fbank 80 pasm (wymog modelu)
+SPK_THRESH = 0.30      # prog STARTU regionu chronionego (podobienstwo po normalizacji
+                       # kanalu). NIE obnizac: przy 0.20 pokrycie syntezy 100%, ale
+                       # falszywa ochrona ludzkiej mowy skacze do 10.6% (apka nie tnie).
+SPK_THRESH_LO = 0.25   # prog KONTYNUACJI (histereza). Synteza to CIAGLY blok jednego
+                       # glosu, wiec gdy region JUZ sie zaczal, sasiednie okna wystarcza
+                       # ze sa "podobne", nie "pewne". ZMIERZONE: sam prog 0.30 lapal
+                       # tylko 80% okien syntezy (co piate przeciekalo i tam ciecia
+                       # lecialy normalnie - Michal to slyszal). Histereza domyka bloki
+                       # NIE ruszajac progu startu. ZMIERZONE (prog startu 0.30):
+                       #   lo 0.30 (brak histerezy): synteza 80%, ludzki 2.3%
+                       #   lo 0.25 (TU):             synteza 91%, ludzki 3.9%
+                       #   lo 0.20:                  synteza 95%, ludzki 6.5%
+                       # Wybrane 0.25 - najlepsze pokrycie przy falszywej ochronie <=5%.
+                       # Ponizej 0.20 pokrycie NIE rosnie, a ludzki dalej sie psuje.
+SPK_PAD = 0.75         # margines regionu chronionego (s); 0.3 s bylo za waskie
+SPK_MERGE_GAP = 1.5    # scal chronione regiony rozdzielone krotsza luka
+SPK_MIN_RMS = 0.005    # ciszy nie ma sensu porownywac (nie ma barwy glosu)
+
+_spk_sess = None
+
+def _get_spk():
+    """Sesja ONNX modelu embeddingow mowcy (CAMPPlus, 27 MB, Apache-2.0).
+    Zwraca None gdy modelu/onnxruntime brak - wtedy ochrona glosow jest po prostu
+    nieaktywna (log mowi GDZIE szukalem; cichy brak funkcji to blad, ktory juz
+    popelnilem przy VAD)."""
+    global _spk_sess
+    if _spk_sess is not None:
+        return _spk_sess or None
+    try:
+        import onnxruntime as ort
+    except Exception as e:
+        log(f"onnxruntime niedostepny ({e!r}) - ochrona glosow wylaczona")
+        _spk_sess = False
+        return None
+    kand = [os.environ.get("SPK_MODEL")] + [os.path.join(d, "campplus.onnx")
+                                            for d in _model_candidates()]
+    for p in [k for k in kand if k]:
+        if os.path.exists(p):
+            try:
+                _spk_sess = ort.InferenceSession(p, providers=["CPUExecutionProvider"])
+                log(f"model glosow: {os.path.basename(p)}")
+                return _spk_sess
+            except Exception as e:
+                log(f"blad ladowania modelu glosow ({e!r})")
+    log("model glosow nie znaleziony (szukalem w: %s) - ochrona glosow wylaczona"
+        % ", ".join(str(k) for k in kand if k))
+    _spk_sess = False
+    return None
+
+def _spk_fbank(seg):
+    """80-pasmowy fbank + CMN, zgodnie z 3D-Speaker. Bez ditheringu (powtarzalnosc)."""
+    import kaldi_native_fbank as knf
+    o = knf.FbankOptions()
+    o.frame_opts.samp_freq = SPK_SR
+    o.frame_opts.dither = 0.0
+    o.frame_opts.snip_edges = True
+    o.mel_opts.num_bins = SPK_MEL
+    f = knf.OnlineFbank(o)
+    f.accept_waveform(SPK_SR, (seg * 32768.0).tolist())
+    f.input_finished()
+    fr = [f.get_frame(i) for i in range(f.num_frames_ready)]
+    if not fr:
+        return None
+    X = np.array(fr, dtype=np.float32)
+    return X - X.mean(axis=0, keepdims=True)
+
+def _spk_embed(y16, sess, co="glosy", hop=None):
+    """Embeddingi (192D, znormalizowane) per okno SPK_WIN, krokiem `hop` (domyslnie
+    SPK_HOP). Okna ZACHODZA na siebie - bez tego przeciekalo 20% syntezy (krotkie
+    fragmenty i granice okien mieszaly sie z glosem sasiada)."""
+    win = int(SPK_WIN * SPK_SR)
+    krok = int((hop if hop else SPK_HOP) * SPK_SR)
+    out, poz = [], []
+    idx = list(range(0, max(0, len(y16) - win + 1), krok))
+    for k, i in enumerate(idx):
+        seg = y16[i:i + win]
+        if float(np.sqrt(np.mean(seg ** 2))) < SPK_MIN_RMS:
+            continue
+        X = _spk_fbank(seg)
+        if X is None:
+            continue
+        try:
+            e = sess.run(None, {sess.get_inputs()[0].name: X[None, :, :]})[0][0]
+        except Exception as e_:
+            log(f"blad modelu glosow ({e_!r}) - ochrona przerwana")
+            return np.zeros((0, 0)), []
+        out.append(e / (np.linalg.norm(e) + 1e-9))
+        poz.append(i / SPK_SR)
+        if idx and k % 400 == 0:
+            progress(78 + 2 * (k + 1) / len(idx), f"Wykrywanie {co}: {k+1}/{len(idx)}")
+    return np.array(out, dtype=np.float64), poz
+
+def wzorzec_glosu(src, start=None, dur=None):
+    """Wzorzec z DOWOLNEGO formatu audio (mp3/flac/m4a/wav...) - dekodowanie ffmpegiem
+    do PCM 16 kHz mono, jak reszta wejsc aplikacji. Opcjonalnie wycinek [start, start+dur].
+    Zwraca (wektor 192D, spojnosc_probki) albo (None, 0.0).
+    Spojnosc < 0.6 oznacza, ze probka zawiera WIECEJ NIZ JEDEN glos albo cisze -
+    GUI pokazuje ja userowi, bo zla probka daje bezuzyteczny wzorzec."""
+    sess = _get_spk()
+    if sess is None:
+        return None, 0.0
+    # numpy/soundfile: nazwy modulowe powstaja dopiero w _load_light/_load_heavy, wiec
+    # NIE testuj `np is None` - przed pierwszym ladowaniem nazwa nie istnieje (NameError).
+    # _load_light jest idempotentne i tanie.
+    _load_light()
+    tmp = os.path.join(os.environ.get("TEMP") or "/tmp", "_czysc_wzorzec.wav")
+    cmd = [_ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error"]
+    if start is not None:
+        cmd += ["-ss", str(float(start))]
+    if dur:
+        cmd += ["-t", str(float(dur))]
+    cmd += ["-i", src, "-ar", str(SPK_SR), "-ac", "1", "-c:a", "pcm_s16le", tmp]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True)
+        y, _ = sf.read(tmp, dtype="float32")
+    except Exception as e:
+        log(f"nie moge zdekodowac probki glosu ({e!r})")
+        return None, 0.0
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    E, _ = _spk_embed(y.astype(np.float32), sess, co="wzorca glosu")
+    if len(E) < 2:
+        log("probka glosu za krotka/za cicha (min ~4 s mowy)")
+        return None, 0.0
+    c = E.mean(axis=0)
+    c = c / (np.linalg.norm(c) + 1e-9)
+    return c, float(np.mean(E @ c))
+
+def wczytaj_wzorce(sciezka):
+    """Wzorce glosow z JSON zapisanego przez GUI: {"wzorce":[{"nazwa":..,"wektor":[..]}]}.
+    Bledny/niekompletny plik NIE moze wywalic przetwarzania - loguje i zwraca [] (wtedy
+    ochrona jest nieaktywna, ale plik zostanie przetworzony)."""
+    if not sciezka or not os.path.exists(sciezka):
+        return []
+    try:
+        d = json.load(open(sciezka, encoding="utf-8"))
+        out = []
+        for w in d.get("wzorce", []):
+            v = w.get("wektor") or []
+            if len(v) >= 64:                       # 192D w CAMPPlus; sanity, nie sztywno
+                out.append([float(x) for x in v])
+        if out:
+            log(f"chronione głosy: wczytano {len(out)} wzorc(ów)")
+        return out
+    except Exception as e:
+        log(f"nie moge wczytac wzorcow glosow ({e!r}) - ochrona glosow nieaktywna")
+        return []
+
+
+def detect_protected_voices(y_full, wzorce):
+    """Regiony (start, end) podobne do KTOREGOKOLWIEK wzorca - chronione przed cieciami.
+    NORMALIZACJA KANALU (kluczowa): embedding koduje takze tor nagrania (mikrofon,
+    kompresja, tlo), wspolny dla calego pliku. BEZ odjecia sredniej pliku wzorce
+    "chronily" 98.1% CALEGO materialu (artefakt - apka przestalaby cokolwiek wycinac);
+    po odjeciu 4.3%, czyli realny udzial syntezy. Ta sama srednia stosowana do wzorcow,
+    zeby porownanie bylo w tej samej przestrzeni."""
+    if not wzorce:
+        return []
+    sess = _get_spk()
+    if sess is None:
+        return []
+    y16 = (librosa.resample(y_full, orig_sr=SR, target_sr=SPK_SR)
+           if SR != SPK_SR else y_full).astype(np.float32)
+    E, poz = _spk_embed(y16, sess)
+    if len(E) < 3:
+        return []
+    mu = E.mean(axis=0)
+    def _cn(X):
+        Z = X - mu
+        return Z / (np.linalg.norm(Z, axis=1, keepdims=True) + 1e-9)
+    En = _cn(E)
+    W = _cn(np.array([w for w in wzorce], dtype=np.float64))
+    sim = np.max(En @ W.T, axis=1)
+    # HISTEREZA: region startuje na oknie PEWNYM (>= SPK_THRESH) i ciagnie sie przez okna
+    # tylko PODOBNE (>= SPK_THRESH_LO). Bez tego co piate okno syntezy przeciekalo, bo
+    # spadalo pod prog (mieszanka z sasiednim glosem, koncowka wypowiedzi, cichszy
+    # fragment) - a ciecia w tej dziurze byly slyszalne.
+    okna = []
+    aktywny = False
+    for i, s in enumerate(sim):
+        if s >= SPK_THRESH:
+            aktywny = True
+        elif s < SPK_THRESH_LO:
+            aktywny = False
+        if aktywny:
+            okna.append((poz[i], poz[i] + SPK_WIN))
+    if not okna:
+        log(f"chronione glosy: brak dopasowan (prog {SPK_THRESH:.2f})")
+        return []
+    reg = _scal_regiony(okna, SPK_PAD, SPK_MERGE_GAP)
+    tot = sum(b - a for a, b in reg)
+    log(f"chronione głosy: {len(reg)} region(ów), łącznie {tot/60:.1f} min "
+        f"({100*len(okna)/max(len(En),1):.0f}% materiału) - z {len(wzorce)} wzorc(ów)")
+    return reg
+
+
+def _get_vad():
+    """Sesja ONNX Silero VAD. None gdy model/onnxruntime niedostepne (wtedy fallback
+    na stary guard AST - lepiej czyscic slabiej niz pasc)."""
+    global _vad_sess
+    if _vad_sess is not None:
+        return _vad_sess
+    # Sciezka modelu: env VAD_MODEL (ustawia GUI), a jak nie - WSZYSCY kandydaci
+    # z _model_candidates (env CZYSCICIEL_MODEL_DIR + domyslny LOCALAPPDATA). Ten sam
+    # wzorzec co model fillerow/muzyki i fallback DFN - bez niego wystarczy, ze env
+    # nie dotrze (uruchomienie CLI, inny profil) i guard po cichu sie NIE wlacza.
+    kandydaci = [os.environ.get("VAD_MODEL", "").strip()] + [
+        os.path.join(d, "silero_vad.onnx") for d in _model_candidates()]
+    path = next((p for p in kandydaci if p and os.path.exists(p)), None)
+    if path is None:
+        log("model VAD nie znaleziony - guard mowy wylaczony "
+            f"(szukalem w: {', '.join(p for p in kandydaci if p)})")
+        return None
+    try:
+        import onnxruntime as ort
+        so = ort.SessionOptions()
+        so.inter_op_num_threads = so.intra_op_num_threads = 1   # maly model: 1 watek szybszy
+        _vad_sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+        return _vad_sess
+    except Exception as e:
+        log(f"onnxruntime niedostepny ({e!r}) - guard mowy wylaczony")
+        return None
+
+def detect_speech(y_full):
+    """Zwraca liste (start_s, end_s) regionow MOWY (ludzkiej ORAZ syntetycznej).
+    Uzywane jako WETO dla wycinania odglosow: co Silero uznaje za mowe, tego nie tniemy
+    jako chrzakniecie/oddech/mlasniecie. Zwraca [] gdy VAD niedostepny."""
+    sess = _get_vad()
+    if sess is None:
+        return []
+    y16 = (librosa.resample(y_full, orig_sr=SR, target_sr=VAD_SR)
+           if SR != VAD_SR else y_full).astype(np.float32)
+    state = np.zeros((2, 1, 128), dtype=np.float32)
+    ctx = np.zeros(VAD_CTX, dtype=np.float32)
+    sr_arr = np.array(VAD_SR, dtype=np.int64)
+    okna, n = [], len(y16)
+    nwin = max(1, n // VAD_WIN)
+    for wi, i in enumerate(range(0, n - VAD_WIN, VAD_WIN)):
+        blok = y16[i:i + VAD_WIN]
+        try:
+            p, state = sess.run(None, {"input": np.concatenate([ctx, blok]).reshape(1, -1),
+                                       "state": state, "sr": sr_arr})
+        except Exception as e:
+            log(f"blad VAD ({e!r}) - guard mowy przerwany")
+            return []
+        ctx = blok[-VAD_CTX:]
+        if float(p[0][0]) >= VAD_THRESH:
+            okna.append((i / VAD_SR, (i + VAD_WIN) / VAD_SR))
+        if wi % 500 == 0:
+            progress(76 + 2 * (wi + 1) / nwin, f"Wykrywanie mowy: {wi+1}/{nwin}")
+    regions = _scal_regiony(okna, VAD_PAD, VAD_MERGE_GAP)
+    tot = sum(b - a for a, b in regions)
+    log(f"mowa (VAD): {len(regions)} region(ow), lacznie {tot/60:.1f} min")
+    return regions
+
+def _scal_regiony(flagi, pad, gap):
+    """Scala okna w regiony: rozszerza o `pad` i zlepia te rozdzielone luka <= `gap`.
+    Wydzielone z detect_tts, by dalo sie przetestowac bez modelu (patrz verify_app.py):
+    to tu siedzial bug zgloszony przez Michala - bez `gap` okno, w ktorym AST chwilowo
+    uznal synteze za mowe, tworzylo LUKE i przez nia przeciskalo sie ciecie."""
+    out = []
+    for a, b in flagi:
+        a = max(0.0, a - pad); b = b + pad
+        if out and a <= out[-1][1] + gap:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
 # ---------- ITERACJA DOMYKAJACA (idempotencja) ----------
 # Detekcja per-okno + prog daja efekt: plik przemielony ponownie lapie kilka nowych,
 # krotkich fillerow/pauz (graniczne przypadki, ktore po zmianie kontekstu przekraczaja
@@ -592,6 +938,123 @@ def compute_keeps(total_frames, sr, cuts):
         prev = b
     if prev < total_frames: keeps.append((prev, total_frames))
     return keeps, merged
+
+# ---------- ODSZUMIANIE (DeepFilterNet3, opcjonalne) ----------
+# Osobny program deep-filter.exe (Rust, MIT/Apache-2.0) dociagany przez bootstrap jak
+# ffmpeg - ZERO zaleznosci Pythona (pakiet pip nie ma wheela dla 3.12) i liczy na CPU,
+# wiec nie konkuruje z detekcja o GPU. Model jest MASKUJACY (tlumi szum, nie dorabia
+# tresci) - patrz DFN_ATTEN nizej: NIE uzywamy domyslnego 100 dB narzedzia, bo na
+# nagraniach zdalnych wchodzi w glos; zmierzone: za 1 dB cichszego tla placi sie ~5-9 dB
+# glebsza ingerencja w mowe. NIE jest dereverberem (p_reverb=0.1 w treningu).
+DFN_SR = 48000             # deep-filter przyjmuje WYLACZNIE 48 kHz WAV
+DFN_TAIL = 1440            # wyjscie jest KROTSZE o tyle probek @48k (30 ms) MIMO -D;
+                           # stale, zmierzone na kazdym poziomie tlumienia -> kompensujemy
+                           # jak encoder delay MP3, inaczej rozjedzie sie os czasu
+
+def _dfn_bin():
+    """Sciezka do deep-filter.exe. Jak przy modelach (pulapka v1.5.1): env DFN_BIN
+    ustawia GUI, ale gdyby go brakowalo (CLI, zle env), probujemy domyslnej lokalizacji
+    %LOCALAPPDATA%\\Czysciciel\\tools - inaczej opcja cicho nie dziala."""
+    for p in (os.environ.get("DFN_BIN", ""),
+              os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                           "Czysciciel", "tools", "deep-filter.exe")):
+        if p and os.path.exists(p):
+            return p
+    return ""
+
+def denoise_file(ain, outdir, stem, atten_db, sr, ch):
+    """Odszumia CALY plik przed detekcja i cieciem. Zwraca sciezke nowego WAV
+    (w oryginalnym sr/ch) albo None gdy sie nie udalo - wtedy wolajacy zostaje
+    przy nieodszumionym materiale (lepiej wyczyscic bez denoise niz pasc)."""
+    dfn = _dfn_bin()
+    if not dfn or not os.path.exists(dfn):
+        log("odszumianie: brak deep-filter.exe - pomijam")
+        return None
+    ff = _ffmpeg_bin()
+    tmp48 = os.path.join(outdir, stem + "_tmp_dfn48.wav")
+    dfn_out_dir = os.path.join(outdir, stem + "_tmp_dfn_out")
+    try:
+        # 1. do 48k (wymog modelu). Kanaly zachowujemy - DFN radzi sobie ze stereo.
+        r = subprocess.run([ff, "-y", "-i", ain, "-ar", str(DFN_SR), "-c:a", "pcm_s16le", tmp48],
+                           capture_output=True, text=True, **_win_kw())
+        if not (os.path.exists(tmp48) and os.path.getsize(tmp48) > 1000):
+            log(f"odszumianie: konwersja do 48k nie wyszla ({r.stderr[-200:]}) - pomijam")
+            return None
+        # 2. odszum (-D kompensuje opoznienie STFT/lookahead modelu)
+        os.makedirs(dfn_out_dir, exist_ok=True)
+        r = subprocess.run([dfn, "-a", str(atten_db), "-D", "-o", dfn_out_dir, tmp48],
+                           capture_output=True, text=True, **_win_kw())
+        den = os.path.join(dfn_out_dir, os.path.basename(tmp48))
+        if not (os.path.exists(den) and os.path.getsize(den) > 1000):
+            log(f"odszumianie: deep-filter nie dal wyniku ({(r.stderr or '')[-200:]}) - pomijam")
+            return None
+        # 3. KOMPENSACJA skrocenia + powrot do oryginalnego sr/ch, by dalszy pipeline
+        # (detekcja, ciecia, RPP, rozdzialy) liczyl na tej samej osi czasu co wejscie
+        out = os.path.join(outdir, stem + "_tmp_odszum.wav")
+        pad = f"apad=pad_len={DFN_TAIL}" if DFN_TAIL else "anull"
+        r = subprocess.run([ff, "-y", "-i", den, "-af", pad,
+                            "-ar", str(sr), "-ac", str(ch), "-c:a", "pcm_s16le", out],
+                           capture_output=True, text=True, **_win_kw())
+        if not (os.path.exists(out) and os.path.getsize(out) > 1000):
+            log(f"odszumianie: powrot do {sr} Hz nie wyszedl - pomijam")
+            return None
+        log(f"odszumiono (tlumienie {atten_db} dB, kompensacja {DFN_TAIL} próbek)")
+        return out
+    except Exception as e:
+        log(f"odszumianie pominięte (błąd: {e})")
+        return None
+    finally:
+        for p in (tmp48,):
+            try:
+                if os.path.exists(p): os.remove(p)
+            except Exception: pass
+        try:
+            if os.path.isdir(dfn_out_dir): shutil.rmtree(dfn_out_dir, ignore_errors=True)
+        except Exception: pass
+
+# ---------- NORMALIZACJA GLOSNOSCI (EBU R128 / LUFS, opcjonalna) ----------
+# CELE: -16 LUFS = poziom publikacji podcastow (Apple), -23 LUFS = NORMA EBU R128
+# (Target Level, punkt h; true peak <= -1 dBTP, punkt m), -14 LUFS = Spotify.
+# UWAGA: -16/-14 to poziomy odtwarzania PLATFORM, nie normy - nie nazywac ich norma.
+#
+# DLACZEGO NIE loudnorm w jednym przebiegu: gdy zadany cel wymaga wiekszego wzmocnienia
+# niz pozwala true peak, loudnorm PO CICHU przechodzi w tryb "dynamic" i KOMPRESUJE
+# dynamike (zmierzone: cel -16 na materiale -21.4 LUFS => gain skacze 2.76..7.66 dB,
+# rozrzut 4.91 dB). Dlatego: mierzymy raz (ebur128), potem STALY gain + limiter tylko
+# na szczyty. Limiter w OVERSAMPLINGU 4x, bo alimiter nie jest true-peak (limit -1.5
+# dawal realne -1.0 dBTP).
+LUFS_TARGETS = {"-16": -16.0, "-23": -23.0, "-14": -14.0}
+TP_CEILING = -1.5          # dBTP; zapas wzgl. wymaganego przez R128 -1 dBTP
+LIM_OS = 4                 # krotnosc oversamplingu limitera (176.4k dla 44.1k)
+
+def measure_loudness(path):
+    """Mierzy (integrated LUFS, true peak dBTP) filtrem ebur128. Zwraca (None, None)
+    gdy pomiar sie nie uda - wtedy normalizacje pomijamy, nie zgadujemy."""
+    ff = _ffmpeg_bin()
+    r = subprocess.run([ff, "-hide_banner", "-i", path, "-af", "ebur128=peak=true",
+                        "-f", "null", "-"], capture_output=True, text=True, **_win_kw())
+    err = r.stderr or ""
+    # bierzemy OSTATNIE wystapienie (podsumowanie na koncu), nie chwilowe odczyty
+    mi = re.findall(r"I:\s+(-?\d+\.\d+)\s+LUFS", err)
+    mp = re.findall(r"Peak:\s+(-?\d+\.\d+)\s+dBFS", err)
+    if not mi or not mp:
+        return None, None
+    return float(mi[-1]), float(mp[-1])
+
+def loudness_filter(cur_lufs, cur_tp, target_lufs, sr):
+    """Buduje lancuch ffmpeg: STALY gain + limiter true-peak w oversamplingu.
+    Zwraca (filtr, gain_db, czy_limiter_bedzie_pracowal)."""
+    gain = target_lufs - cur_lufs
+    peak_after = cur_tp + gain
+    need_lim = peak_after > TP_CEILING
+    vol = f"volume={gain:.2f}dB"
+    if not need_lim:
+        # zapas na szczyty wystarcza - czysty gain, ZERO ingerencji w dynamike
+        return vol, gain, False
+    os_sr = int(sr * LIM_OS)
+    return (f"aresample={os_sr}:resampler=soxr:precision=28,{vol},"
+            f"alimiter=limit={TP_CEILING}dB:level=disabled:attack=5:release=50,"
+            f"aresample={sr}:resampler=soxr:precision=28"), gain, True
 
 # ---------- CIECIE STRUMIENIOWE ----------
 def cut_stream(ain, keeps, aout, sr, ch):
@@ -913,6 +1376,20 @@ def export_rpp_marked(rpp_path, source_file, keeps, merged, sr, src_delay=0):
 
 def main():
     import argparse
+    # TRYB WZORCA GLOSU: liczy jeden embedding z probki i wypisuje go jako WZORZEC|{json}.
+    # Osobna, wczesna sciezka - GUI wola to przy dodawaniu glosu do ochrony i NIE chce
+    # ladowac torcha ani przechodzic przez caly parser wejscia/wyjscia.
+    if "--wzorzec" in sys.argv:
+        i = sys.argv.index("--wzorzec")
+        src = sys.argv[i + 1] if len(sys.argv) > i + 1 else ""
+        st = float(sys.argv[i + 2]) if len(sys.argv) > i + 2 else None
+        du = float(sys.argv[i + 3]) if len(sys.argv) > i + 3 else None
+        c, spoj = wzorzec_glosu(src, st, du)
+        if c is None:
+            return 2
+        print("WZORZEC|" + json.dumps({"wektor": [float(x) for x in c],
+                                       "spojnosc": round(spoj, 4)}), flush=True)
+        return 0
     global CUT, KEEP, TARGET, MUSIC_THRESH
     PRESETY = {
         "zachowawczy": (0.30, 0.70, 0.60),
@@ -962,6 +1439,11 @@ def main():
                          "wyzszy = chroni tylko wyrazna muzyke, tlo tnie; nizszy = chroni juz przy sladzie muzyki)")
     ap.add_argument("--dokladny", action="store_true",
                     help="tryb dokladny: weryfikuj DO OPORU (wiele rund az nic nie zostanie do wyciecia); wydluza przetwarzanie")
+    # CHRONIONE GLOSY: plik JSON z wzorcami (lista wektorow 192D) zapisany przez GUI.
+    # Nie przez argv, bo wektory to setki liczb - i user moze miec kilka wzorcow.
+    ap.add_argument("--chronione-glosy", default="",
+                    help="sciezka do JSON z wzorcami glosow do OCHRONY (nie tnij tam nic); "
+                         "GUI zapisuje ten plik z listy 'Chronione glosy'")
     # ODGLOSY: dodatkowe kategorie do wyciecia (jak fillery: tylko poza muzyka i mowa).
     # Domyslnie WYLACZONE - wlaczane osobnymi flagami (GUI: checkboxy).
     ap.add_argument("--tnij-chrzakniecia", action="store_true",
@@ -970,6 +1452,17 @@ def main():
                     help="wycinaj oddechy, wdechy, pociagniecia nosem (poza muzyka i mowa)")
     ap.add_argument("--tnij-mlasniecia", action="store_true",
                     help="wycinaj mlasniecia, cmokniecia, kliki ustne (poza muzyka i mowa)")
+    # ODSZUMIANIE (DeepFilterNet) - domyslnie WYLACZONE. Na czystym nagraniu studyjnym
+    # szkodzi (zmierzone: tlo cichnie o 0.11 dB przy 6 dB ingerencji w mowe).
+    ap.add_argument("--odszum", action="store_true",
+                    help="odszum nagranie modelem DeepFilterNet PRZED detekcja (dla nagran zdalnych)")
+    ap.add_argument("--odszum-sila", type=int, default=6, choices=[6, 12, 100],
+                    help="tlumienie szumu w dB: 6=delikatnie (domyslnie), 12=srednio, 100=mocno")
+    # NORMALIZACJA GLOSNOSCI - domyslnie WYLACZONA
+    ap.add_argument("--normalizuj", action="store_true",
+                    help="normalizuj glosnosc do zadanego poziomu LUFS (staly gain + limiter true-peak)")
+    ap.add_argument("--lufs", default="-16", choices=sorted(LUFS_TARGETS),
+                    help="cel: -16=podcast/Apple (domyslnie), -23=norma EBU R128, -14=Spotify")
     # zgodnosc wstecz:
     ap.add_argument("--bez-pauz", action="store_true", help="alias --tryb fillery")
     ap.add_argument("--rpp", action="store_true", help="alias --eksport oba")
@@ -1021,6 +1514,18 @@ def main():
             log(f"BŁĄD remuxu, używam oryginału bezpośrednio. ffmpeg: {r.stderr[-300:]}")
             src_wav = ain
         ain_proc = src_wav
+
+        # 1b. ODSZUMIANIE (opcjonalne, DOMYSLNIE OFF) - PRZED detekcja i cieciem, by
+        # detektory (fillery/muzyka/odglosy) i eksport pracowaly na tym samym sygnale.
+        # Zachowuje dlugosc (kompensacja DFN_TAIL), wiec ciecia, rozdzialy i RPP zostaja
+        # na tej samej osi czasu. Porazka = log + praca na materiale nieodszumionym.
+        if a.odszum:
+            progress(8, "Odszumianie (DeepFilterNet)...")
+            log(f"odszumiam modelem DeepFilterNet (tłumienie {a.odszum_sila} dB)...")
+            _i = sf.info(ain_proc)
+            _den = denoise_file(ain_proc, outdir, stem, a.odszum_sila, _i.samplerate, _i.channels)
+            if _den:
+                ain_proc = _den
 
         # 2. wczytanie 16k mono + detekcja (region GPU pod miedzyprocesowym zamkiem:
         # w trybie wsadowym enkode/ciecie poprzedniego pliku (CPU) nachodzi na
@@ -1080,6 +1585,7 @@ def main():
 
             # 2b. MUZYKA: domyslnie chronimy fragmenty z muzyka - odrzucamy ciecia w muzyce
             # (model fillerow myli spiew/instrumenty z "yyy"). Wylaczane --bez-omijania-muzyki.
+            glosy = wczytaj_wzorce(a.chronione_glosy)
             omijaj_muzyke = not a.bez_omijania_muzyki
             if omijaj_muzyke and allc:
                 log(f"ochrona muzyki: włączona (próg {MUSIC_THRESH:.2f})")
@@ -1087,14 +1593,22 @@ def main():
                 before = len(allc)
                 allc, removed = filter_cuts_by_music(allc, music)
                 if music:
-                    log(f"muzyka chroniona: odrzucono {removed}/{before} cięć w muzyce")
-                # gdy prawie caly material to muzyka - ostrzez (bramka calego pliku)
-                if music:
+                    log(f"chronione (muzyka): odrzucono {removed}/{before} cięć")
+                    # gdy prawie caly material to muzyka - ostrzez (bramka calego pliku)
                     total_music = sum(b-a for a, b in music)
                     if total_music >= 0.9 * (len(y)/SR):
                         log("UWAGA: materiał to niemal w całości muzyka - nic nie wycinam")
             elif not omijaj_muzyke:
                 log("omijanie muzyki WYŁĄCZONE - tnę w całym materiale")
+            # CHRONIONE GLOSY: NIEZALEZNE od ochrony muzyki - dziala takze gdy user
+            # muzyki nie chroni. Wzorce podaje UZYTKOWNIK (automat wybieral zly glos:
+            # lapal dominujacego mowce, nie synteze - patrz komentarz przy SPK_*).
+            if glosy and allc:
+                chronione = detect_protected_voices(y, glosy)
+                if chronione:
+                    before = len(allc)
+                    allc, removed = filter_cuts_by_music(allc, chronione)
+                    log(f"chronione głosy: odrzucono {removed}/{before} cięć")
         # <- tu zamek GPU zwolniony: dalej same operacje CPU/dysk (ciecie, enkode)
 
         json.dump({"fillers": allc}, open(os.path.join(outdir, f"ciecia_{stem}.json"), "w"), indent=1)
@@ -1134,6 +1648,22 @@ def main():
             def encode(wav_in, out_path, etap, chap_meta=None):
                 progress(90, etap)
                 log(etap)
+                # NORMALIZACJA (opcjonalna): mierzymy gotowy, POCIETY material i liczymy
+                # STALY gain. Pomiar musi byc na tym co realnie wychodzi - ciecia zmieniaja
+                # glosnosc zintegrowana (usuwamy pauzy = material gestszy).
+                af_norm = None
+                if a.normalizuj:
+                    tgt = LUFS_TARGETS[a.lufs]
+                    progress(88, "Pomiar głośności (EBU R128)...")
+                    cur_i, cur_tp = measure_loudness(wav_in)
+                    if cur_i is None:
+                        log("normalizacja: pomiar głośności nie powiódł się - pomijam")
+                    else:
+                        af_norm, gain, lim = loudness_filter(cur_i, cur_tp, tgt, sr)
+                        log(f"głośność: {cur_i:.1f} LUFS / szczyt {cur_tp:.1f} dBTP "
+                            f"-> cel {tgt:.0f} LUFS (wzmocnienie {gain:+.2f} dB, "
+                            + (f"limiter true-peak {TP_CEILING} dBTP" if lim
+                               else "bez limitera - zapas na szczyty wystarcza") + ")")
                 # 2 wejscia: [0]=czysty WAV (audio), [1]=oryginal (zrodlo tagow/okladki)
                 # opcjonalnie [2]=ffmetadata ze SKORYGOWANYMI rozdzialami
                 enc = [ff, "-y", "-i", wav_in, "-i", ain]
@@ -1149,6 +1679,8 @@ def main():
                     enc += ["-map_chapters", "2"]
                 else:
                     enc += ["-map_chapters", "-1"]
+                if af_norm:
+                    enc += ["-af", af_norm]
                 enc += ["-c:a", kodek]
                 if stratny:
                     enc += ["-b:a", f"{a.bitrate}k"]
@@ -1167,6 +1699,7 @@ def main():
                     if chap_meta:
                         enc2 += ["-i", chap_meta, "-map", "0:a", "-map_chapters", "1"]
                     enc2 += ["-c:a", kodek]
+                    if af_norm: enc2 += ["-af", af_norm]
                     if stratny: enc2 += ["-b:a", f"{a.bitrate}k"]
                     if a.kanaly == "mono": enc2 += ["-ac", "1"]
                     elif a.kanaly == "stereo": enc2 += ["-ac", "2"]
@@ -1237,6 +1770,10 @@ def main():
 
         if src_wav != ain and os.path.exists(src_wav):
             os.remove(src_wav)
+        # posredni WAV po odszumianiu (gdy uzyte) - sprzataj jak src_wav
+        if ain_proc not in (ain, src_wav) and os.path.exists(ain_proc):
+            try: os.remove(ain_proc)
+            except Exception: pass
         if chapters_meta and os.path.exists(chapters_meta):
             try: os.remove(chapters_meta)
             except Exception: pass
