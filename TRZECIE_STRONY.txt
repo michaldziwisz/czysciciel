@@ -58,13 +58,24 @@ Komponenty pobierane przy pierwszym uruchomieniu do
     Licencja: Apache License 2.0
     Źródło: https://github.com/csukuangfj/kaldi-native-fbank
 
+13. Model klasyfikacji dźwięku AST (AudioSet) - funkcje "ochrona
+    muzyki" oraz "wycinanie odgłosów"
+    MIT/ast-finetuned-audioset-10-10-0.4593
+    Licencja: BSD-3-Clause
+    Źródło: https://huggingface.co/MIT/ast-finetuned-audioset-10-10-0.4593
+
+14. DeepFilterNet3 (odszumianie mowy) - gotowy plik wykonywalny
+    deep-filter.exe z wydań autora
+    Licencja: MIT lub Apache License 2.0 (podwójna, do wyboru)
+    Źródło: https://github.com/Rikorose/DeepFilterNet
+
 Komponenty użyte do zbudowania launchera:
 
-13. wxPython
+15. wxPython
     Licencja: wxWindows Library Licence (liberalna, oparta na LGPL)
     Źródło: https://wxpython.org
 
-14. PyInstaller
+16. PyInstaller
     Licencja: GPL-2.0 z wyjątkiem pozwalającym na dystrybucję
     zbudowanych aplikacji pod dowolną licencją.
     Źródło: https://pyinstaller.org
