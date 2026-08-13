@@ -35,3 +35,5 @@ _spk_model/
 _silvenv/
 # paczka release: buduje ja CI (build.yml) i wrzuca do Release - NIE do repo
 Czysciciel-windows.zip
+# artefakty audytu dostepnosci (zrzuty UIA, pomiary kontrastu, podglady stron)
+_audyt/

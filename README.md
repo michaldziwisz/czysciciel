@@ -132,6 +132,68 @@ Przyciskiem „Otwórz folder wyniku" szybko przejdziesz do gotowych plików.
 
 ---
 
+## Obsługa z klawiatury i czytnikiem ekranu
+
+Cały program obsłużysz bez myszy. Tabulatorem przechodzisz po kolejnych
+elementach okna, spacja zaznacza i odznacza pliki na liście oraz przełącza pola
+wyboru, a Escape zamyka okna komunikatów.
+
+Skróty poniżej działają z klawiszem Alt (na przykład Alt+U uruchamia
+czyszczenie). Każdy skrót jest przypisany do dokładnie jednej rzeczy, więc
+naciśnięcie zawsze robi to samo. Tam, gdzie w nazwie widzisz „(Alt+cyfra)",
+skrótem jest cyfra.
+
+| Skrót | Działanie |
+|-------|-----------|
+| **F5** albo **Alt+U** | uruchamia czyszczenie |
+| **Alt+T** | zatrzymuje przetwarzanie |
+| **Alt+D** | dodaje pliki |
+| **Alt+J** | dodaje folder |
+| **Alt+Z** | usuwa zaznaczony plik z listy |
+| **Alt+1** | czyści całą listę |
+| **Alt+K** | przechodzi do listy plików |
+| **Alt+S** | poziom skracania pauz |
+| **Alt+I** | minimalna długość fillera |
+| **Alt+F** | format wyjściowy |
+| **Alt+A** | kanały (mono, stereo) |
+| **Alt+B** | jakość, czyli bitrate |
+| **Alt+2** | zapis osobnego pliku z wyciętym materiałem |
+| **Alt+M** | pomijanie fragmentów z muzyką |
+| **Alt+O** | czułość wykrywania muzyki |
+| **Alt+H** | wycinanie chrząknięć, kaszlu, kichnięć |
+| **Alt+3** | wycinanie oddechów i pociągnięć nosem |
+| **Alt+4** | wycinanie mlaśnięć i cmoknięć |
+| **Alt+G** | dodaje chroniony głos z pliku |
+| **Alt+5** | usuwa chroniony głos |
+| **Alt+W** | wyrównanie głośności |
+| **Alt+6** | docelowy poziom głośności |
+| **Alt+N** | odszumianie |
+| **Alt+7** | siła odszumiania |
+| **Alt+L** | folder wyjściowy |
+| **Alt+Y** | wybór folderu wyjściowego |
+| **Alt+8** | liczba plików przetwarzanych równolegle |
+| **Alt+9** | tryb dokładny |
+| **Alt+R** | otwiera folder z wynikiem |
+| **Alt+E** | przechodzi do dziennika |
+| **Ctrl+O** | dodaje pliki (z menu Program) |
+| **Alt+F4** | zamyka program |
+
+### Co usłyszysz w czytniku ekranu
+
+Program sam zgłasza postęp mową, więc nie musisz sprawdzać, czy jeszcze pracuje:
+
+- rozpoczęcie czyszczenia wraz z liczbą plików,
+- zakończenie każdego pliku („Plik 2 z 5 gotowy"),
+- zakończenie całości, zatrzymanie oraz błąd,
+- postęp jednorazowej instalacji środowiska przy pierwszym uruchomieniu
+  (co 25 procent).
+
+Pełny przebieg pracy zawsze znajdziesz też w dzienniku (Alt+E), a bieżący stan
+w etykiecie nad nim. Ogłoszenia korzystają z NVDA, JAWS albo głosu systemowego —
+tego, co masz uruchomione.
+
+---
+
 ## Poziomy skracania pauz
 
 | Poziom       | Nie rusza pauz do | Dłuższe skraca do | Efekt              |

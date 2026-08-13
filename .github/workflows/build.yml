@@ -29,7 +29,7 @@ jobs:
       - name: Zainstaluj zaleznosci buildu
         run: |
           python -m pip install --upgrade pip
-          pip install wxpython pyinstaller
+          pip install wxpython pyinstaller accessible_output2
 
       - name: Zbuduj launcher (PyInstaller onedir)
         run: |
@@ -40,6 +40,9 @@ jobs:
             --add-data "gui.py;." `
             --add-data "assets/czysciciel.ico;assets" `
             --collect-submodules wx `
+            --collect-all accessible_output2 `
+            --collect-all libloader `
+            --collect-all platform_utils `
             czysciciel.py
 
       - name: Dolacz dokumenty do paczki

@@ -17,6 +17,60 @@ Funkcje:
 """
 import os, sys, threading, subprocess, queue, time, json
 import wx
+import wx.lib.scrolledpanel as scrolled
+
+# Mowa czytnika ekranu (ogloszenia postepu). Opcjonalna: gdy biblioteki nie ma,
+# aplikacja dziala normalnie, tylko bez ogloszen - dlatego import w try.
+try:
+    import accessible_output2.outputs.auto as _ao2
+    _MOWA = _ao2.Auto()
+except Exception:
+    _MOWA = None
+
+
+def ogloszenie(tekst, przerwij=False):
+    """Oglasza komunikat czytnikowi ekranu (NVDA/JAWS/SAPI).
+
+    ZMIERZONE: wxPython nie potrafi ustawic obszaru "live" (UIA LiveSetting jest
+    zawsze 0), a SetLabel na etykiecie statusu NIE JEST oglaszany samoczynnie.
+    Bez tej funkcji osoba niewidoma nie wie, na jakim etapie jest przetwarzanie,
+    dopoki sama nie przejdzie fokusem do statusu (WCAG 4.1.3).
+
+    Wolamy TYLKO na kamieniach milowych (start i koniec pliku, koniec calosci,
+    blad) - ogloszanie kazdego procentu byloby tak samo uciazliwe jak cisza.
+    """
+    if _MOWA is None or not tekst:
+        return
+    try:
+        _MOWA.speak(tekst, interrupt=przerwij)
+    except Exception:
+        pass          # mowa nigdy nie moze wywalic przetwarzania
+
+
+class NazwaDostepna(wx.Accessible):
+    """Nadaje nazwe i opis dostepny kontrolce, ktora inaczej ich nie ma.
+
+    POWOD (zmierzone na wxWidgets 3.3.3): dla wx.SpinCtrlDouble ANI SetName, ANI
+    SetHelpText, ANI SetToolTip, ANI sasiadujaca etykieta NIE nadaja nazwy
+    elementowi, ktory realnie dostaje fokus - czytnik odczytuje samo "0.30".
+    SpinCtrlDouble jest kontenerem; fokus idzie na wewnetrzne wx.TextCtrl,
+    wiec obiekt tej klasy trzeba ustawic WLASNIE na tym dziecku (patrz
+    nazwij_pole_liczbowe). Referencje trzymamy w atrybucie okna, bo po zebraniu
+    przez odsmiecacz nazwa przestaje dzialac.
+    """
+
+    def __init__(self, nazwa, opis=""):
+        super().__init__()
+        self._nazwa = nazwa
+        self._opis = opis
+
+    def GetName(self, childId):
+        return (wx.ACC_OK, self._nazwa)
+
+    def GetDescription(self, childId):
+        if self._opis:
+            return (wx.ACC_OK, self._opis)
+        return (wx.ACC_NOT_IMPLEMENTED, "")
 
 APP_NAME = "Czysciciel"          # klucz techniczny: nazwa exe i folderu %LOCALAPPDATA% (bez ogonka)
 APP_TITLE = "Czyściciel"         # nazwa wyswietlana czlowiekowi
@@ -132,27 +186,101 @@ class MainFrame(wx.Frame):
         except Exception:
             pass
 
+    def _nazwij_kontrolke(self, ctrl, nazwa, opis=""):
+        """Nadaje nazwe dostepna kontrolce, ktorej SetName nie wystarcza.
+
+        Dotyczy kontrolek opartych na natywnych klasach Windows (wx.ListCtrl ->
+        SysListView32, wx.TextCtrl wielolinijkowy). ZMIERZONE: dla listy plikow
+        SetName z tresc instrukcji byl w kodzie, a UIA i NVDA raportowaly nazwe
+        PUSTA - czyli najwazniejsza kontrolka programu byla dla czytnika
+        bezimienna. wx.Accessible ustawiony wprost na kontrolce to naprawia.
+        """
+        if not hasattr(self, "_akcesoria"):
+            self._akcesoria = []
+        ctrl.SetName(nazwa)
+        a = NazwaDostepna(nazwa, opis)
+        self._akcesoria.append(a)
+        try:
+            ctrl.SetAccessible(a)
+        except Exception:
+            pass
+        if opis:
+            try:
+                ctrl.SetToolTip(opis)
+            except Exception:
+                pass
+
+    def _nazwij_pole_liczbowe(self, ctrl, nazwa, opis=""):
+        """Nadaje nazwe dostepna polu liczbowemu (wx.SpinCtrlDouble / wx.SpinCtrl).
+
+        Ustawia wx.Accessible na WEWNETRZNYM wx.TextCtrl, bo to ono dostaje fokus
+        i jego nazwe czyta czytnik ekranu. Sam SetName na kontrolce nie wystarcza
+        (zmierzone: nazwa pusta, czytnik mowi tylko wartosc). Dla pewnosci
+        ustawiamy takze na kontrolce nadrzednej - gdy przyszla wersja wxWidgets
+        zmieni budowe kontrolki, nazwa nadal bedzie skad wziac.
+        """
+        if not hasattr(self, "_akcesoria"):
+            self._akcesoria = []       # referencje: bez nich odsmiecacz zabiera obiekty
+        # ZMIERZONE zachowanie dwoch typow pol liczbowych w wxWidgets 3.3.3:
+        #  - wx.SpinCtrlDouble ma dzieci [TextCtrl, SpinButton]; fokus idzie na
+        #    TextCtrl, wiec wx.Accessible ustawiony na TYM dziecku dziala i daje
+        #    zarowno nazwe, jak i opis (NVDA czyta oba);
+        #  - wx.SpinCtrl (calkowity) ma ZERO dzieci - jest jedna kontrolka
+        #    natywna, ktora nazwe bierze z sasiedniej etykiety, a naszego
+        #    wx.Accessible ignoruje. Tam opisu nie da sie podac osobno, wiec
+        #    doklejamy go do NAZWY: lepiej dluzsza nazwa niz zgubiona informacja.
+        dzieci_txt = [c for c in ctrl.GetChildren() if isinstance(c, wx.TextCtrl)]
+        if dzieci_txt:
+            cele = dzieci_txt + [ctrl]
+            pelna_nazwa = nazwa
+        else:
+            cele = [ctrl]
+            pelna_nazwa = f"{nazwa}. {opis}" if opis else nazwa
+        ctrl.SetName(pelna_nazwa)
+        for cel in cele:
+            a = NazwaDostepna(pelna_nazwa, opis)
+            self._akcesoria.append(a)
+            try:
+                cel.SetAccessible(a)
+            except Exception:
+                pass
+        if opis:
+            try:
+                ctrl.SetToolTip(opis)     # widzacym tez sie przyda
+            except Exception:
+                pass
+
     def _build_ui(self):
-        panel = wx.Panel(self)
+        # Panel PRZEWIJANY, nie zwykly wx.Panel. Bez tego przy domyslnym rozmiarze
+        # okna dolne kontrolki (przycisk uruchomienia, pasek postepu, status,
+        # dziennik) byly przyciete albo w ogole nie powstawaly w drzewie
+        # dostepnosci, a okno nie mialo paska przewijania - czyli nie bylo jak do
+        # nich dotrzec wzrokiem ani powiekszeniem (WCAG 1.4.10, 1.4.4).
+        panel = scrolled.ScrolledPanel(self, style=wx.TAB_TRAVERSAL)
+        self.panel = panel
         # akcelerator: SetName wszedzie dla NVDA + StaticText PRZED kontrolka
         root = wx.BoxSizer(wx.VERTICAL)
 
         # --- lista plikow ---
-        lbl_list = wx.StaticText(panel, label="&Pliki do wyczyszczenia:")
+        lbl_list = wx.StaticText(panel, label="Pli&ki do wyczyszczenia:")
         root.Add(lbl_list, 0, wx.LEFT | wx.TOP, 8)
         self.lst = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
         self.lst.EnableCheckBoxes(True)
         self.lst.InsertColumn(0, "Plik", width=430)
         self.lst.InsertColumn(1, "Ścieżka", width=280)
-        self.lst.SetName("Lista plików do wyczyszczenia. Spacja zaznacza lub odznacza.")
+        self._nazwij_kontrolke(
+            self.lst,
+            "Lista plików do wyczyszczenia",
+            "Spacja zaznacza lub odznacza plik. Delete usuwa go z listy.")
+
         root.Add(self.lst, 1, wx.EXPAND | wx.ALL, 8)
 
         # przyciski listy
         row_btn = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_add = wx.Button(panel, label="&Dodaj pliki...")
-        self.btn_addfolder = wx.Button(panel, label="Dodaj &folder...")
-        self.btn_del = wx.Button(panel, label="&Usuń z listy")
-        self.btn_clear = wx.Button(panel, label="Wy&czyść listę")
+        self.btn_addfolder = wx.Button(panel, label="Doda&j folder...")
+        self.btn_del = wx.Button(panel, label="Usuń &z listy")
+        self.btn_clear = wx.Button(panel, label="Wyczyść listę (Alt+&1)")
         for b in (self.btn_add, self.btn_addfolder, self.btn_del, self.btn_clear):
             b.SetName(b.GetLabel().replace("&", ""))
             row_btn.Add(b, 0, wx.RIGHT, 6)
@@ -181,11 +309,14 @@ class MainFrame(wx.Frame):
 
         # min filler
         r2 = wx.BoxSizer(wx.HORIZONTAL)
-        lbl_mf = wx.StaticText(panel, label="&Minimalna długość fillera (s):")
+        lbl_mf = wx.StaticText(panel, label="M&inimalna długość fillera (s):")
         r2.Add(lbl_mf, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.sc_minfiller = wx.SpinCtrlDouble(panel, min=0.10, max=1.00, inc=0.05, initial=0.30)
         self.sc_minfiller.SetDigits(2)
-        self.sc_minfiller.SetName("Minimalna długość fillera w sekundach")
+        self._nazwij_pole_liczbowe(
+            self.sc_minfiller,
+            "Minimalna długość fillera w sekundach",
+            "Krótsze wtrącenia są pomijane. Domyślnie 0,30 sekundy.")
         r2.Add(self.sc_minfiller, 0, wx.ALIGN_CENTER_VERTICAL)
         opt.Add(r2, 0, wx.EXPAND | wx.ALL, 5)
         root.Add(opt, 0, wx.EXPAND | wx.ALL, 8)
@@ -199,7 +330,7 @@ class MainFrame(wx.Frame):
         self.ch_format.SetSelection(0)  # mp3
         self.ch_format.SetName("Format wyjściowy")
         rf.Add(self.ch_format, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
-        lbl_ch = wx.StaticText(panel, label="&Kanały:")
+        lbl_ch = wx.StaticText(panel, label="K&anały:")
         rf.Add(lbl_ch, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.ch_kanaly = wx.Choice(panel, choices=["jak w źródle", "mono", "stereo"])
         self.ch_kanaly.SetSelection(2)  # stereo
@@ -237,8 +368,11 @@ class MainFrame(wx.Frame):
 
         # opcja dodatkowa: osobny plik z wycietymi fragmentami (do odsluchu)
         self.cb_wyciete = wx.CheckBox(panel,
-            label="Zapisz też osobny plik z tym, co &wycięte (do odsłuchu)")
-        self.cb_wyciete.SetName("Zapisz osobny plik z wyciętymi fragmentami")
+            label="Zapisz też osobny plik z tym, co wycięte, do odsłuchu (Alt+&2)")
+        self._nazwij_kontrolke(
+            self.cb_wyciete,
+            "Zapisz osobny plik z wyciętymi fragmentami",
+            "Powstaje dodatkowy plik z materiałem, który został usunięty. Do odsłuchu.")
         root.Add(self.cb_wyciete, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         # ochrona muzyki: NIE wycinaj fillerow/pauz z fragmentow, w ktorych gra muzyka
@@ -256,7 +390,10 @@ class MainFrame(wx.Frame):
         rm.Add(self.lbl_prog, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.sl_muzyka = wx.Slider(panel, value=50, minValue=0, maxValue=100,
                                    style=wx.SL_HORIZONTAL)
-        self.sl_muzyka.SetName("Czułość wykrywania muzyki w procentach. 100 chroni najwięcej, 0 wyłącza")
+        self._nazwij_kontrolke(
+            self.sl_muzyka,
+            "Czułość wykrywania muzyki",
+            "Wartość w procentach. 100 chroni najwięcej fragmentów, 0 wyłącza ochronę muzyki.")
         rm.Add(self.sl_muzyka, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.lbl_prog_val = wx.StaticText(panel, label="50%")
         self.lbl_prog_val.SetName("Wartość czułości")
@@ -272,16 +409,16 @@ class MainFrame(wx.Frame):
         lbl_odg = wx.StaticText(panel, label="Dodatkowo wycinaj odgłosy (gdy nie ma muzyki):")
         root.Add(lbl_odg, 0, wx.LEFT | wx.TOP, 8)
         self.cb_chrzak = wx.CheckBox(panel,
-            label="&Chrząknięcia, kaszel, kichnięcia")
-        self.cb_chrzak.SetName("Wycinaj chrząknięcia, kaszel i kichnięcia")
+            label="C&hrząknięcia, kaszel, kichnięcia")
+        self._nazwij_kontrolke(self.cb_chrzak, "Wycinaj chrząknięcia, kaszel i kichnięcia")
         root.Add(self.cb_chrzak, 0, wx.LEFT | wx.RIGHT, 8)
         self.cb_oddech = wx.CheckBox(panel,
-            label="&Oddechy, wdechy, pociągnięcia nosem")
-        self.cb_oddech.SetName("Wycinaj oddechy, wdechy i pociągnięcia nosem")
+            label="Oddechy, wdechy, pociągnięcia nosem (Alt+&3)")
+        self._nazwij_kontrolke(self.cb_oddech, "Wycinaj oddechy, wdechy i pociągnięcia nosem")
         root.Add(self.cb_oddech, 0, wx.LEFT | wx.RIGHT, 8)
         self.cb_mlask = wx.CheckBox(panel,
-            label="M&laśnięcia, cmoknięcia, kliknięcia ustne")
-        self.cb_mlask.SetName("Wycinaj mlaśnięcia, cmoknięcia i kliknięcia ustne")
+            label="Mlaśnięcia, cmoknięcia, kliknięcia ustne (Alt+&4)")
+        self._nazwij_kontrolke(self.cb_mlask, "Wycinaj mlaśnięcia, cmoknięcia i kliknięcia ustne")
         root.Add(self.cb_mlask, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         # --- CHRONIONE GLOSY (wzorce mowcy) ---
@@ -299,14 +436,17 @@ class MainFrame(wx.Frame):
         # ListBox, nie ListCtrl: czytniki ekranu czytaja go bez dodatkowych zabiegow,
         # a lista jest jednokolumnowa (nazwa + spojnosc w jednym wierszu).
         self.lst_glosy = wx.ListBox(panel, size=(-1, 90), style=wx.LB_SINGLE)
-        self.lst_glosy.SetName("Lista chronionych głosów")
+        self._nazwij_kontrolke(
+            self.lst_glosy,
+            "Lista chronionych głosów",
+            "Głosy z tej listy nie są nigdy wycinane. Wzorce działają też w kolejnych sesjach.")
         sb_gl.Add(self.lst_glosy, 1, wx.EXPAND | wx.ALL, 6)
         rg = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_gl_add = wx.Button(panel, label="Dodaj &głos z pliku...")
-        self.btn_gl_add.SetName("Dodaj chroniony głos z pliku audio")
+        self._nazwij_kontrolke(self.btn_gl_add, "Dodaj chroniony głos z pliku audio")
         rg.Add(self.btn_gl_add, 0, wx.RIGHT, 6)
-        self.btn_gl_del = wx.Button(panel, label="&Usuń głos")
-        self.btn_gl_del.SetName("Usuń zaznaczony chroniony głos")
+        self.btn_gl_del = wx.Button(panel, label="Usuń głos (Alt+&5)")
+        self._nazwij_kontrolke(self.btn_gl_del, "Usuń zaznaczony chroniony głos")
         rg.Add(self.btn_gl_del, 0)
         sb_gl.Add(rg, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
         root.Add(sb_gl, 0, wx.EXPAND | wx.ALL, 8)
@@ -323,11 +463,13 @@ class MainFrame(wx.Frame):
         sb_ob = wx.StaticBoxSizer(box_ob, wx.VERTICAL)
 
         self.cb_norm = wx.CheckBox(panel, label="&Wyrównaj głośność (LUFS)")
-        self.cb_norm.SetName("Wyrównaj głośność nagrania do wybranego poziomu. "
-                             "Nie zmienia dynamiki - stałe wzmocnienie plus zabezpieczenie szczytów")
+        self._nazwij_kontrolke(
+            self.cb_norm,
+            "Wyrównaj głośność",
+            "Wyrównuje głośność nagrania do wybranego poziomu. Nie zmienia dynamiki wypowiedzi.")
         sb_ob.Add(self.cb_norm, 0, wx.ALL, 4)
         r_lufs = wx.BoxSizer(wx.HORIZONTAL)
-        self.lbl_lufs = wx.StaticText(panel, label="&Poziom docelowy:")
+        self.lbl_lufs = wx.StaticText(panel, label="Poziom docelowy (Alt+&6):")
         r_lufs.Add(self.lbl_lufs, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.ch_lufs = wx.Choice(panel, choices=LUFS_OPISY)
         self.ch_lufs.SetSelection(0)
@@ -335,17 +477,21 @@ class MainFrame(wx.Frame):
         r_lufs.Add(self.ch_lufs, 0, wx.ALIGN_CENTER_VERTICAL)
         sb_ob.Add(r_lufs, 0, wx.LEFT | wx.BOTTOM, 20)
 
-        self.cb_odszum = wx.CheckBox(panel, label="&Odszum nagranie")
-        self.cb_odszum.SetName("Odszum nagranie modelem DeepFilterNet. Przydatne przy nagraniach "
-                               "zdalnych. Na czystym nagraniu studyjnym nie jest potrzebne")
+        self.cb_odszum = wx.CheckBox(panel, label="Odszum &nagranie")
+        self._nazwij_kontrolke(
+            self.cb_odszum,
+            "Odszum nagranie",
+            "Usuwa szum modelem DeepFilterNet. Przydatne przy nagraniach z szumem tła.")
         sb_ob.Add(self.cb_odszum, 0, wx.ALL, 4)
         r_ods = wx.BoxSizer(wx.HORIZONTAL)
-        self.lbl_odszum = wx.StaticText(panel, label="Siła odszu&miania:")
+        self.lbl_odszum = wx.StaticText(panel, label="Siła odszumiania (Alt+&7):")
         r_ods.Add(self.lbl_odszum, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.ch_odszum = wx.Choice(panel, choices=ODSZUM_OPISY)
         self.ch_odszum.SetSelection(0)
-        self.ch_odszum.SetName("Siła odszumiania. Delikatnie jest zalecane - mocniejsze ustawienia "
-                               "bardziej ingerują w głos")
+        self._nazwij_kontrolke(
+            self.ch_odszum,
+            "Siła odszumiania",
+            "Delikatnie jest zalecane. Mocniejsze ustawienia bardziej ingerują w głos.")
         r_ods.Add(self.ch_odszum, 0, wx.ALIGN_CENTER_VERTICAL)
         sb_ob.Add(r_ods, 0, wx.LEFT | wx.BOTTOM, 20)
         root.Add(sb_ob, 0, wx.EXPAND | wx.ALL, 8)
@@ -357,13 +503,13 @@ class MainFrame(wx.Frame):
 
         # --- folder wyjsciowy ---
         r3 = wx.BoxSizer(wx.HORIZONTAL)
-        lbl_out = wx.StaticText(panel, label="Folder &wyjściowy:")
+        lbl_out = wx.StaticText(panel, label="Fo&lder wyjściowy:")
         r3.Add(lbl_out, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.txt_out = wx.TextCtrl(panel)
         self.txt_out.SetName("Folder wyjściowy")
         self.txt_out.SetHint("domyślnie obok pliku wejściowego")
         r3.Add(self.txt_out, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.btn_out = wx.Button(panel, label="&Wybierz...")
+        self.btn_out = wx.Button(panel, label="W&ybierz...")
         self.btn_out.SetName("Wybierz folder wyjściowy")
         r3.Add(self.btn_out, 0)
         root.Add(r3, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
@@ -373,11 +519,21 @@ class MainFrame(wx.Frame):
         # na CPU (enkode/ciecie) - karta obsluguje 1 plik naraz (zamek GPU w worker).
         # Wiecej = szybszy wsad, ale wiecej RAM/dysku (kazdy plik trzyma ~2GB WAV).
         rpar = wx.BoxSizer(wx.HORIZONTAL)
-        lbl_par = wx.StaticText(panel, label="Przetwarzaj &równolegle plików:")
+        lbl_par = wx.StaticText(panel, label="Przetwarzaj równolegle plików (Alt+&8):")
         rpar.Add(lbl_par, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.sc_workers = wx.SpinCtrl(panel, min=1, max=4, initial=2)
-        self.sc_workers.SetName("Liczba plików przetwarzanych równolegle. Domyślnie 2. "
-                                "Karta graficzna obsługuje jeden plik naraz, reszta czeka na nią.")
+        # SpinCtrlDouble z zerem cyfr po przecinku, NIE wx.SpinCtrl. Powod jest
+        # wylacznie dostepnosciowy: wx.SpinCtrl to jedna kontrolka natywna bez
+        # dzieci, ktora nazwe bierze z sasiedniej etykiety i ignoruje wlasny
+        # wx.Accessible - nie da sie wiec dolozyc do niej OPISU dla czytnika
+        # ekranu. SpinCtrlDouble ma wewnetrzne pole edycji, na ktorym opis dziala.
+        # Zachowanie dla uzytkownika jest identyczne: wartosci calkowite 1-4.
+        self.sc_workers = wx.SpinCtrlDouble(panel, min=1, max=4, inc=1, initial=2)
+        self.sc_workers.SetDigits(0)
+        self._nazwij_pole_liczbowe(
+            self.sc_workers,
+            "Liczba plików przetwarzanych równolegle",
+            "Domyślnie 2. Karta graficzna obsługuje jeden plik naraz, "
+            "reszta czeka na nią.")
         rpar.Add(self.sc_workers, 0, wx.ALIGN_CENTER_VERTICAL)
         root.Add(rpar, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
@@ -385,20 +541,24 @@ class MainFrame(wx.Frame):
         # Domyslnie worker robi kilka rund domykajacych (do ~0.3s przyrostu). Tryb
         # dokladny iteruje az NIC nie zostanie do wyciecia - kosztem czasu.
         self.cb_dokladny = wx.CheckBox(panel,
-            label="Tryb do&kładny (weryfikuj do oporu — może wydłużyć przetwarzanie)")
-        self.cb_dokladny.SetName("Tryb dokładny. Powtarza weryfikację aż nic nie zostanie "
-                                 "do wycięcia. Daje najczystszy wynik, ale może znacznie "
-                                 "wydłużyć przetwarzanie, zwłaszcza długich nagrań.")
+            label="Tryb dokładny, weryfikuj do oporu — może wydłużyć przetwarzanie (Alt+&9)")
+        self._nazwij_kontrolke(
+            self.cb_dokladny,
+            "Tryb dokładny",
+            "Powtarza weryfikację, aż nic nie zostanie do wycięcia. Może wydłużyć przetwarzanie.")
         root.Add(self.cb_dokladny, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         # --- start/stop ---
         r4 = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_start = wx.Button(panel, label="Ur&uchom czyszczenie  (F5)")
+        self.btn_start = wx.Button(panel, label="&Uruchom czyszczenie  (F5)")
         self.btn_start.SetName("Uruchom czyszczenie")
         self.btn_stop = wx.Button(panel, label="Za&trzymaj")
         self.btn_stop.SetName("Zatrzymaj")
         self.btn_stop.Disable()
-        self.btn_openout = wx.Button(panel, label="&Otwórz folder wyniku")
+        # ZMIERZONE: mnemonik dziala poprawnie w obu wariantach napisu. Wczesniej
+        # wygladalo, ze Alt+R nie dziala, ale przyczyna byla inna - handler
+        # cicho konczyl prace, gdy folder wyniku nie istnial (patrz on_open_out).
+        self.btn_openout = wx.Button(panel, label="Otwó&rz folder wyniku")
         self.btn_openout.SetName("Otwórz folder wyniku")
         for b in (self.btn_start, self.btn_stop, self.btn_openout):
             r4.Add(b, 0, wx.RIGHT, 6)
@@ -406,20 +566,28 @@ class MainFrame(wx.Frame):
 
         # --- pasek postepu ---
         self.gauge = wx.Gauge(panel, range=100)
-        self.gauge.SetName("Postęp")
+        self._nazwij_kontrolke(self.gauge, "Postęp")
         root.Add(self.gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
         self.lbl_status = wx.StaticText(panel, label="Gotowy.")
-        self.lbl_status.SetName("Status")
+        self._nazwij_kontrolke(self.lbl_status, "Status")
         root.Add(self.lbl_status, 0, wx.ALL, 8)
 
         # --- dziennik ---
-        lbl_log = wx.StaticText(panel, label="Dzienni&k:")
+        lbl_log = wx.StaticText(panel, label="Dzi&ennik:")
         root.Add(lbl_log, 0, wx.LEFT, 8)
         self.log = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP)
-        self.log.SetName("Dziennik")
+        self._nazwij_kontrolke(
+            self.log,
+            "Dziennik",
+            "Pełny przebieg pracy programu. Tekst tylko do czytania.")
         root.Add(self.log, 1, wx.EXPAND | wx.ALL, 8)
 
         panel.SetSizer(root)
+        # Wlacza przewijanie pionowe i liczy realny rozmiar zawartosci. Bez tego
+        # ScrolledPanel zachowuje sie jak zwykly panel i tresc nadal jest ucieta.
+        panel.SetupScrolling(scroll_x=False, scroll_y=True, scrollToTop=True)
+        # Przewijanie MYSZKA i kolkiem jest dodatkiem - obsluga z klawiatury
+        # dziala przez tabulacje (fokus sam przewija panel do kontrolki).
 
         # zdarzenia
         self.btn_add.Bind(wx.EVT_BUTTON, self.on_add)
@@ -513,8 +681,19 @@ class MainFrame(wx.Frame):
         if os.path.isdir(d):
             try:
                 os.startfile(d)  # Windows
-            except Exception:
+            except Exception as e:
                 self.append_log("Nie mogę otworzyć folderu: " + d)
+                self.set_status("Nie udało się otworzyć folderu")
+                ogloszenie(f"Nie udało się otworzyć folderu. {e}", przerwij=True)
+        else:
+            # Bez tego przycisk po prostu NIC nie robil, gdy folder jeszcze nie
+            # istnieje (np. przed pierwszym przetworzeniem albo gdy sciezka
+            # zrodlowa zniknela). Cisza jest dla osoby niewidomej nieodroznialna
+            # od zawieszenia programu, wiec zawsze musi pasc komunikat.
+            self.append_log("Folder nie istnieje: " + d)
+            self.set_status("Folder wyniku jeszcze nie istnieje")
+            ogloszenie("Folder wyniku jeszcze nie istnieje. Pojawi się po "
+                       "przetworzeniu pierwszego pliku.", przerwij=True)
 
     def on_format_change(self, evt):
         """Bitrate ma sens tylko dla formatow stratnych - wylacz liste dla bezstratnych."""
@@ -598,6 +777,7 @@ class MainFrame(wx.Frame):
         # liczenie embeddingu w WATKU - inaczej GUI zamarza (i czytnik milczy)
         self.btn_gl_add.Enable(False)
         self.set_status("Analizuję próbkę głosu...")
+        ogloszenie("Analizuję próbkę głosu. To potrwa kilkanaście sekund.")
         threading.Thread(target=self._glos_worker, args=(src,), daemon=True).start()
 
     def _glos_worker(self, src):
@@ -637,6 +817,9 @@ class MainFrame(wx.Frame):
         self._save_settings()
         self.btn_gl_add.Enable(True)
         self.set_status(f"Dodano chroniony głos: {nazwa} (jakość {spojnosc:.2f})")
+        # KAMIEN MILOWY: analiza probki trwa kilkanascie sekund, wiec jej wynik
+        # musi byc oglaszany - inaczej uzytkownik nie wie, czy sie udalo.
+        ogloszenie(f"Dodano chroniony głos: {nazwa}.")
         # focus na liste - user od razu slyszy, co dodal
         self.lst_glosy.SetSelection(len(self.glosy) - 1)
         self.lst_glosy.SetFocus()
@@ -693,7 +876,9 @@ class MainFrame(wx.Frame):
             "zapisz_wyciete": self.cb_wyciete.GetValue(),
             "omijaj_muzyke": self.cb_muzyka.GetValue(),
             "prog_muzyki": self.sl_muzyka.GetValue(),
-            "workers": self.sc_workers.GetValue(),
+            # int(): SpinCtrlDouble zwraca float (2.0), a dalej liczba jest uzywana
+            # jako liczba procesow i trafia do zapisu ustawien
+            "workers": int(self.sc_workers.GetValue()),
             "dokladny": self.cb_dokladny.GetValue(),
             "tnij_chrzak": self.cb_chrzak.GetValue(),
             "tnij_oddech": self.cb_oddech.GetValue(),
@@ -743,7 +928,10 @@ class MainFrame(wx.Frame):
         _val(self.cb_wyciete, "zapisz_wyciete", bool)
         _val(self.cb_muzyka, "omijaj_muzyke", bool)
         _val(self.sl_muzyka, "prog_muzyki", int)
-        _val(self.sc_workers, "workers", int)
+        # (int, float): kontrolka jest teraz SpinCtrlDouble (patrz komentarz przy
+        # jej tworzeniu), wiec zapisana wartosc moze byc int albo float
+        _val(self.sc_workers, "workers", (int, float))
+
         _val(self.cb_dokladny, "dokladny", bool)
         _val(self.cb_chrzak, "tnij_chrzak", bool)
         _val(self.cb_oddech, "tnij_oddech", bool)
@@ -813,7 +1001,7 @@ class MainFrame(wx.Frame):
         prog_muzyki = 1.0 - self.sl_muzyka.GetValue() / 100.0
         wariant_rpp = WARIANTY_RPP[self.rb_wariant.GetSelection()][0]
         outdir = self.txt_out.GetValue().strip() or None
-        workers = self.sc_workers.GetValue()
+        workers = int(self.sc_workers.GetValue())   # SpinCtrlDouble zwraca float
         dokladny = self.cb_dokladny.GetValue()
         tnij_chrzak = self.cb_chrzak.GetValue()
         tnij_oddech = self.cb_oddech.GetValue()
@@ -840,6 +1028,9 @@ class MainFrame(wx.Frame):
         self.worker_thread = threading.Thread(
             target=self._run_all, args=(files, opts), daemon=True)
         self.worker_thread.start()
+        # KAMIEN MILOWY: start pracy. Przerywamy biezaca wypowiedz, bo to reakcja
+        # na swiadome dzialanie uzytkownika i ma dojsc od razu.
+        ogloszenie(f"Rozpoczynam czyszczenie. Plików: {len(files)}.", przerwij=True)
 
     def on_stop(self, evt):
         self.stop_flag.set()
@@ -924,6 +1115,14 @@ class MainFrame(wx.Frame):
         self._done_cnt = getattr(self, "_done_cnt", 0) + 1
         self._slots.pop(label, None)
         self._render_status()
+        # KAMIEN MILOWY: koniec pliku - oglaszamy czytnikowi ekranu, bo sama
+        # zmiana etykiety statusu nie jest oglaszana samoczynnie (WCAG 4.1.3).
+        n = getattr(self, "_n_total", 0)
+        stan = "gotowy" if good else "błąd"
+        if n > 1:
+            ogloszenie(f"Plik {self._done_cnt} z {n} {stan}: {base}")
+        else:
+            ogloszenie(f"Plik {stan}: {base}")
 
     def _render_status(self):
         """Status zbiorczy dla czytnika: ile gotowe + co aktualnie w toku."""
@@ -1060,6 +1259,12 @@ class MainFrame(wx.Frame):
     def _boot_progress(self, pct, msg):
         self.gauge.SetValue(max(0, min(100, pct)))
         self.set_status("Instalacja środowiska: " + msg)
+        # Pierwsze uruchomienie pobiera kilka gigabajtow. Oglaszamy PROGI co 25 %,
+        # nie kazda aktualizacje - inaczej czytnik mowilby bez przerwy.
+        prog = (pct // 25) * 25
+        if prog > getattr(self, "_ostatni_prog_boot", -1) and prog > 0:
+            self._ostatni_prog_boot = prog
+            ogloszenie(f"Instalacja środowiska: {prog} procent.")
 
     def set_status(self, s):
         self.lbl_status.SetLabel(s)
@@ -1074,6 +1279,10 @@ class MainFrame(wx.Frame):
         if stopped:
             self.set_status("Zatrzymano.")
             self.gauge.SetValue(0)
+            # Ogloszenie PRZED okienkiem: komunikat modalny i tak zabierze fokus,
+            # ale dzieki temu wynik jest slyszalny takze wtedy, gdy uzytkownik
+            # pracuje w innym oknie i wroci pozniej.
+            ogloszenie(f"Zatrzymano. Ukończono {done} z {total} plików.", przerwij=True)
             wx.MessageBox(f"Przetwarzanie zatrzymane.\nUkończono {done} z {total} plików.",
                           APP_TITLE, wx.OK | wx.ICON_WARNING)
         elif ok:
@@ -1081,6 +1290,8 @@ class MainFrame(wx.Frame):
             self.gauge.SetValue(100)
             # pkt 5: alert w oknie dialogowym po przemieleniu calego wsadu
             if total and done < total:
+                ogloszenie(f"Zakończono z ostrzeżeniami. Udało się {done} z {total} plików.",
+                           przerwij=True)
                 wx.MessageBox(
                     f"Zakończono z ostrzeżeniami.\nUdało się: {done} z {total} plików.\n"
                     "Szczegóły w dzienniku.",
@@ -1088,10 +1299,13 @@ class MainFrame(wx.Frame):
             else:
                 msg = ("Gotowe! Przetworzono plik." if total == 1
                        else f"Gotowe! Przetworzono wszystkie pliki ({done} z {total}).")
+                ogloszenie(msg, przerwij=True)
                 wx.MessageBox(msg, APP_TITLE, wx.OK | wx.ICON_INFORMATION)
         else:
             self.set_status("Zakończono z błędami.")
             self.gauge.SetValue(0)
+            ogloszenie("Przetwarzanie zakończone błędem. Szczegóły w dzienniku.",
+                       przerwij=True)
             wx.MessageBox("Przetwarzanie zakończone błędem.\nSzczegóły w dzienniku.",
                           APP_TITLE, wx.OK | wx.ICON_ERROR)
 
