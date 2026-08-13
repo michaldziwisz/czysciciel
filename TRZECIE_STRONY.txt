@@ -80,4 +80,18 @@ Komponenty użyte do zbudowania launchera:
     zbudowanych aplikacji pod dowolną licencją.
     Źródło: https://pyinstaller.org
 
+17. accessible_output2 (ogłaszanie postępu przez czytnik ekranu)
+    Licencja: MIT
+    Źródło: https://github.com/accessibleapps/accessible_output2
+    Wraz z zależnościami: libloader (MIT) oraz platform_utils (MIT).
+
+18. Biblioteki klienckie czytników ekranu, dostarczane w paczce
+    accessible_output2 i używane do przekazywania komunikatów:
+    nvdaControllerClient32.dll i nvdaControllerClient64.dll (NVDA,
+    licencja LGPL-2.1, https://github.com/nvaccess/nvda), SAAPI32.dll
+    (System Access), dolapi.dll (Dolphin), PCTKUSR.dll i PCTKUSR64.dll
+    (PC-Talker) oraz ZDSRAPI.dll i ZDSRAPI_x64.dll (ZDSR). Każda z nich
+    pozostaje własnością producenta odpowiedniego czytnika i jest
+    rozpowszechniana na jego warunkach, umożliwiających takie użycie.
+
 Pełne teksty licencji dostępne są pod podanymi adresami źródłowymi.
