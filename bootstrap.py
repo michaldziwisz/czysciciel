@@ -24,6 +24,15 @@ Protokol postepu (STDOUT, parsowany przez GUI):
 import os, sys, json, subprocess, shutil, urllib.request, zipfile, tempfile, ssl, time
 import hashlib
 
+# GUI reads the helper protocol as UTF-8. Redirected streams on Windows can
+# otherwise default to cp1252, which cannot even print "moduł" (or its traceback).
+# Configure here too: frozen --run-helper uses runpy in an existing interpreter.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+# Python download helpers also print paths and exceptions through pipes.
+os.environ["PYTHONIOENCODING"] = "utf-8:backslashreplace"
+
 # Windows: uruchamiaj procesy potomne BEZ wlasnego okna konsoli. GUI odpala
 # bootstrap z CREATE_NO_WINDOW, ale ta flaga NIE propaguje sie na WNUKI - kazdy
 # subprocess.run bez niej (uv.exe, python venv, nvidia-smi) dostaje swiezo
@@ -184,7 +193,8 @@ def _unzip_dll_neighbours(zip_path, dest_dir):
 
 def _run(cmd, desc, env=None):
     blog(f"$ {desc}")
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env, **_win_kw())
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=env, **_win_kw())
     if r.returncode != 0:
         tail = (r.stderr or r.stdout or "")[-800:]
         raise RuntimeError(f"{desc} nie powiodlo sie (kod {r.returncode}):\n{tail}")
@@ -244,7 +254,9 @@ def maybe_update_model(P, env):
             "    print('UPD_SKIP', repr(e)[:120]); sys.exit(0)\n"
         )
     try:
-        r = subprocess.run([P["vpy"], dl], capture_output=True, text=True, env=env, timeout=180, **_win_kw())
+        r = subprocess.run([P["vpy"], dl], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", env=env,
+                           timeout=180, **_win_kw())
         if "UPD_OK" in (r.stdout or ""):
             blog("model aktualny (lub pobrano nowsza wersje)")
         else:
@@ -394,7 +406,9 @@ def ensure_music_model(P, env):
             "    print('MUSIC_SKIP', repr(e)[:160]); sys.exit(0)\n"
         )
     try:
-        r = subprocess.run([P["vpy"], dl], capture_output=True, text=True, env=env, timeout=600, **_win_kw())
+        r = subprocess.run([P["vpy"], dl], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", env=env,
+                           timeout=600, **_win_kw())
         if "MUSIC_OK" in (r.stdout or ""):
             blog("model wykrywania muzyki gotowy")
         else:
@@ -542,6 +556,7 @@ def ensure(force_device=None):
     json.dump({"ver": RUNTIME_VER, "device": device, "ts": int(time.time())},
               open(P["ready"], "w", encoding="utf-8"))
     # instalacja skonczona - cache pobierania paczek juz niepotrzebny (kilka GB)
+    boot(99, "Sprzątanie cache pobierania pakietów...")
     cleanup_uv_cache(P)
     boot(100, "Instalacja zakonczona")
     blog("srodowisko gotowe - kolejne uruchomienia beda natychmiastowe")
