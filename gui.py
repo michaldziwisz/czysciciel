@@ -1142,19 +1142,24 @@ class MainFrame(wx.Frame):
                                 text=True, encoding="utf-8", errors="replace",
                                 creationflags=self._no_window())
         self._procs.add(proc)           # rejestr do ubijania (bootstrap tez reaguje na STOP)
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            if line.startswith("BOOT|"):
-                _, pct, msg = line.split("|", 2)
-                wx.CallAfter(self._boot_progress, int(pct), msg)
-            elif line.startswith("BLOG|"):
-                wx.CallAfter(self.append_log, "  " + line[5:])
-            elif line.startswith("BOOTOK|"):
-                _, vpy, ff = line.split("|", 2)
-            elif line.startswith("BOOTERR|"):
-                wx.CallAfter(self.append_log, "BŁĄD instalacji: " + line[8:])
-        proc.wait()
-        self._procs.discard(proc)
+        try:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if line.startswith("BOOT|"):
+                    _, pct, msg = line.split("|", 2)
+                    wx.CallAfter(self._boot_progress, int(pct), msg)
+                elif line.startswith("BLOG|"):
+                    wx.CallAfter(self.append_log, "  " + line[5:])
+                elif line.startswith("BOOTOK|"):
+                    _, vpy, ff = line.split("|", 2)
+                elif line.startswith("BOOTERR|"):
+                    wx.CallAfter(self.append_log, "BŁĄD instalacji: " + line[8:])
+                elif line.strip():
+                    # Startup errors may happen before the BOOTERR handler runs.
+                    wx.CallAfter(self.append_log, "  " + line)
+        finally:
+            proc.wait()
+            self._procs.discard(proc)
         if proc.returncode != 0 or not vpy:
             wx.CallAfter(self.append_log, "Nie udało się przygotować środowiska.")
             return None, None
