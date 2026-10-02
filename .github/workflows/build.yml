@@ -31,6 +31,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install wxpython pyinstaller accessible_output2
 
+      - name: Wykonaj wszystkie testy bez pominięć
+        run: python tests/run_windows.py
+
       - name: Zbuduj launcher (PyInstaller onedir)
         run: |
           pyinstaller --name Czysciciel --windowed --noconfirm --clean `
@@ -44,6 +47,9 @@ jobs:
             --collect-all libloader `
             --collect-all platform_utils `
             czysciciel.py
+
+      - name: Sprawdź potoki gotowego EXE
+        run: python tests/frozen_smoke.py dist/Czysciciel/Czysciciel.exe frozen-smoke
 
       - name: Dolacz dokumenty do paczki
         run: |

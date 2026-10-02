@@ -1,0 +1,25 @@
+name: Testy PR
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-tests:
+    name: Testy Windows 3.12
+    runs-on: windows-latest
+    steps:
+      - name: Pobierz kod
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Ustaw Pythona 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Zainstaluj zależności testów
+        run: python -m pip install wxpython accessible_output2
+      - name: Wykonaj wszystkie testy bez pominięć
+        run: python tests/run_windows.py
