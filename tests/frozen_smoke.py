@@ -67,7 +67,9 @@ if mode == 'parent':
         rows.append({'mode': mode, 'command': command, 'pid': p.pid, 'returncode': p.returncode,
                      'timeout': timed_out, 'stdout': stdout, 'stderr': stderr, 'utf8': utf8, 'ok': ok and utf8 and not timed_out})
     (root / 'result.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(json.dumps(rows, ensure_ascii=False))
+    # Konsola runnera może używać CP1252; JSON ASCII zachowuje Unicode przez escape.
+    # Pełny raport plikowy powyżej pozostaje w UTF-8.
+    print(json.dumps(rows, ensure_ascii=True))
     return 0 if all(r['ok'] for r in rows) else 1
 
 
