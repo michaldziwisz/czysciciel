@@ -1157,9 +1157,22 @@ class MainFrame(wx.Frame):
                 elif line.strip():
                     # Startup errors may happen before the BOOTERR handler runs.
                     wx.CallAfter(self.append_log, "  " + line)
+            proc.wait()  # EOF: zwykła instalacja nie ma limitu czasu.
+        except BaseException as error:
+            # Nie czytamy już potoku. Sam wait zakleszczyłby helper zapisujący
+            # więcej danych niż mieści bufor, więc najpierw go kończymy.
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired) as cleanup_error:
+                error.add_note(f"Nie udało się domknąć instalatora: {cleanup_error}")
+            raise
         finally:
-            proc.wait()
             self._procs.discard(proc)
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
         if proc.returncode != 0 or not vpy:
             wx.CallAfter(self.append_log, "Nie udało się przygotować środowiska.")
             return None, None
