@@ -69,23 +69,30 @@ Komponenty pobierane przy pierwszym uruchomieniu do
     Licencja: MIT lub Apache License 2.0 (podwójna, do wyboru)
     Źródło: https://github.com/Rikorose/DeepFilterNet
 
+15. Respiro-en (model wykrywania oddechów) - funkcja "wycinanie
+    oddechów"
+    Licencja: MIT
+    Źródło: https://github.com/ydqmkkx/Respiro-en
+    Fragment kodu architektury Conformer przepisany z torchaudio 2.7.0
+    (Licencja: BSD-2-Clause, https://github.com/pytorch/audio)
+
 Komponenty użyte do zbudowania launchera:
 
-15. wxPython
+16. wxPython
     Licencja: wxWindows Library Licence (liberalna, oparta na LGPL)
     Źródło: https://wxpython.org
 
-16. PyInstaller
+17. PyInstaller
     Licencja: GPL-2.0 z wyjątkiem pozwalającym na dystrybucję
     zbudowanych aplikacji pod dowolną licencją.
     Źródło: https://pyinstaller.org
 
-17. accessible_output2 (ogłaszanie postępu przez czytnik ekranu)
+18. accessible_output2 (ogłaszanie postępu przez czytnik ekranu)
     Licencja: MIT
     Źródło: https://github.com/accessibleapps/accessible_output2
     Wraz z zależnościami: libloader (MIT) oraz platform_utils (MIT).
 
-18. Biblioteki klienckie czytników ekranu, dostarczane w paczce
+19. Biblioteki klienckie czytników ekranu, dostarczane w paczce
     accessible_output2 i używane do przekazywania komunikatów:
     nvdaControllerClient32.dll i nvdaControllerClient64.dll (NVDA,
     licencja LGPL-2.1, https://github.com/nvaccess/nvda), SAAPI32.dll

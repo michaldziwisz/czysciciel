@@ -29,7 +29,7 @@ jobs:
       - name: Zainstaluj zaleznosci buildu
         run: |
           python -m pip install --upgrade pip
-          pip install wxpython pyinstaller accessible_output2
+          pip install wxpython pyinstaller accessible_output2 numpy
 
       - name: Wykonaj wszystkie testy bez pominięć
         run: python tests/run_windows.py

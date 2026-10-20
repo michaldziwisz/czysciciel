@@ -20,6 +20,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Zainstaluj zależności testów
-        run: python -m pip install wxpython accessible_output2
+        run: python -m pip install wxpython accessible_output2 numpy
       - name: Wykonaj wszystkie testy bez pominięć
         run: python tests/run_windows.py

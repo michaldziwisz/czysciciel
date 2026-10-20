@@ -86,8 +86,8 @@ Twojego profilu użytkownika w folderze:
 - Postęp pobierania widać na pasku i w dzienniku (są odczytywane przez czytnik
   ekranu, więc wiesz, że program pracuje, a nie zawiesił się).
 
-Mniejsze modele (wykrywanie muzyki i odgłosów, rozpoznawanie mowy, rozpoznawanie
-głosów, odszumianie) dociągają się osobno i **bez przebudowy całego środowiska** —
+Mniejsze modele (wykrywanie muzyki i odgłosów, rozpoznawanie mowy, wykrywanie
+oddechów, rozpoznawanie głosów, odszumianie) dociągają się osobno i **bez przebudowy całego środowiska** —
 jeśli masz już program zainstalowany, nowe funkcje pobiorą tylko swoje kilkadziesiąt
 megabajtów.
 
@@ -254,11 +254,14 @@ Wystarczy otworzyć plik `.RPP` w [Reaperze](https://www.reaper.fm/).
    ciche fragmenty. W trybie dokładnym detekcja powtarza się aż do momentu, gdy
    kolejna runda nie znajduje już nic nowego.
 4. **Wykrycie muzyki i odgłosów.** Model `MIT/ast-finetuned-audioset` rozpoznaje
-   muzykę (te fragmenty są chronione przed jakimkolwiek cięciem) oraz — jeśli
-   włączysz — chrząknięcia, oddechy i mlaśnięcia. Odgłosy liczone są na materiale
-   już pozbawionym fillerów i pauz, dzięki czemu model „słyszy" prawdziwą mowę
-   i nie myli końcówek słów z oddechem. Dodatkowy strażnik mowy (Silero VAD)
-   pilnuje, żeby nie ucierpiała żadna głoska.
+   muzykę. Te fragmenty są chronione przed jakimkolwiek cięciem.
+   Oddechów i mlaśnięć program szuka tylko w przerwach mowy, które wyznacza Silero
+   VAD. Cięcie nie wychodzi poza taką przerwę, więc nie zahacza o słowa. Każdy
+   znaleziony dźwięk ocenia model AST z wyciszonym otoczeniem oraz Respiro-en,
+   model wyspecjalizowany w oddechach.
+   Chrząknięcia brzmią dla wykrywacza mowy jak mowa, więc program szuka ich
+   ostrożniej: na materiale bez fillerów i pauz i tylko z dala od słów. Wycina
+   ich niewiele.
 5. **Ochrona wskazanych głosów.** Jeśli dodałeś wzorce, program liczy „odcisk
    głosu" (model CAMPPlus) w oknach po 2 sekundy, przesuwanych co pół sekundy,
    i porównuje je z wzorcami. Miejsca podobne do któregokolwiek wzorca są
@@ -324,6 +327,7 @@ w pliku [`TRZECIE_STRONY.txt`](TRZECIE_STRONY.txt). Najważniejsze:
 - model muzyki i odgłosów `MIT/ast-finetuned-audioset` (BSD-3-Clause),
 - model głosów CAMPPlus / 3D-Speaker, ONNX (Apache-2.0),
 - Silero VAD, wykrywanie mowy (MIT),
+- Respiro-en, wykrywanie oddechów (MIT),
 - DeepFilterNet, odszumianie (MIT / Apache-2.0),
 - PyTorch, Transformers, librosa, soundfile, onnxruntime,
 - ffmpeg (wariant LGPL),

@@ -28,6 +28,8 @@ venv/
 
 # katalog badawczy (pomiary DFN/LUFS) + zrzuty kontrolne - NIE do repo
 _dfn_test/
+# pomiary odglosow (kopie audio, modele, wyniki) - NIE do repo
+_odglosy/
 _gui_kontrolki.txt
 _hermes_verify_*.py
 # modele i venv-y pobierane na czas badan (setki MB) - NIE do repo

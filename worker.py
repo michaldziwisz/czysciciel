@@ -828,6 +828,402 @@ def _scal_regiony(flagi, pad, gap):
             out.append([a, b])
     return [(a, b) for a, b in out]
 
+# ---------- ODGLOSY Z LUK MOWY: oddechy i mlasniecia (ZMIERZONE 20.10.2026) ----------
+# Stary detect_sounds (okna AST 1 s + "brak mowy w promieniu 0.3 s") na 4.4 h audycji
+# znalazl JEDEN oddech: okno 1 s prawie zawsze zahacza o mowe, a 297/365 oddechow lezy
+# blizej niz 0.15 s od slowa. Ta sciezka szuka odglosow TAM, GDZIE NIE MA MOWY:
+#  1. Silero VAD (okna 32 ms, BEZ scalania przerw) wyznacza luki w mowie,
+#  2. w luce: zwarte odcinki >= LUKI_LVL_DB nad tlem (tlo = 10. percentyl poziomu luk),
+#     odsuniete LUKI_EDGE od granicy mowy - ciecie nigdy nie wychodzi poza luke,
+#  3. AST ocenia KANDYDATA Z WYCISZONYM OTOCZENIEM (bez tego okno slyszy slowa obok i
+#     uznaje je za mowe: zmierzone 1514 -> 58 kandydatow "mowy" po wyciszeniu),
+#  4. Respiro-en (detektor oddechow 10 ms, MIT) - glowne zrodlo oddechow: 248 z 365
+#     wykryl tylko on, AST tylko 44.
+# Odsluch Michala (45 oddechow, 30 klikow, losowo): "nie ucina niczego co wazne".
+# CHRZAKNIEC ta sciezka NIE lapie i nie probuje: chrzakniecie jest dzwieczne, Silero
+# bierze je za mowe (mediana 90% ramek), wiec nie ma go w lukach. Skan AST z lokalizacja
+# podfragmentem odrzucony odsluchem (3/32 trafien, 44% narusza mowe) - chrzakniecia
+# zostaja przy detect_sounds.
+LUKI_VAD_ON = 0.5        # p(mowa) Silero >= tyle = mowa
+LUKI_GAP_MIN = 0.12      # krotsza luka nie miesci odglosu
+LUKI_EDGE = 0.06         # odsun od granicy mowy (rozdzielczosc VAD 32 ms + zapas)
+LUKI_RMS_HOP = 0.010     # ramka poziomu (s)
+LUKI_LVL_DB = 8.0        # odglos = tyle dB nad tlem
+LUKI_CISZA_DB = -100.0   # ponizej = cyfrowa cisza, nie liczy sie do tla
+LUKI_MERGE = 0.06        # scal odcinki rozdzielone krotsza przerwa
+LUKI_DMIN, LUKI_DMAX = 0.06, 2.5
+LUKI_MOWA_MAX = 0.15     # AST (otoczenie wyciszone): p(mowa) >= tyle -> nie tniemy
+LUKI_CHRZAK_STOP = 0.15  # AST: p(chrzakniecia) >= tyle -> nie oddech ani klik
+LUKI_ODDECH_AST = 0.15   # AST: p(klas oddechu) >= tyle -> oddech
+LUKI_ODDECH_RESP = 0.5   # Respiro: srednie p w kandydacie >= tyle (i dlugosc >= DMIN) -> oddech
+LUKI_ODDECH_DMIN = 0.15
+LUKI_KLIK_DMAX = 0.25    # klik = krotki transjent
+LUKI_ODRZUC_TOP = {"Beep, bleep", "Music", "Speech", "Computer keyboard", "Busy signal",
+                   "Tuning fork", "Ping"}   # najwyzsza klasa AST = dzwiek programu/mowa
+LUKI_KLIK_TOP = {"Sound effect", "Finger snapping", "Single-lens reflex camera", "Tick",
+                 "Squeak", "Slap, smack", "Knock", "Coin (dropping)", "Crunch", "Clicking",
+                 "Tap", "Click"}           # tak AST nazywa mlasniecia (nie ma klasy klikow ustnych)
+
+def _vad_probs(y16):
+    """Surowe p(mowa) Silero per okno VAD_WIN (32 ms). None gdy VAD niedostepny."""
+    sess = _get_vad()
+    if sess is None:
+        return None
+    y16 = y16.astype(np.float32)
+    state = np.zeros((2, 1, 128), dtype=np.float32)
+    ctx = np.zeros(VAD_CTX, dtype=np.float32)
+    sr_arr = np.array(VAD_SR, dtype=np.int64)
+    out = []
+    for i in range(0, len(y16) - VAD_WIN, VAD_WIN):
+        blok = y16[i:i + VAD_WIN]
+        try:
+            p, state = sess.run(None, {"input": np.concatenate([ctx, blok]).reshape(1, -1),
+                                       "state": state, "sr": sr_arr})
+        except Exception as e:
+            log(f"blad VAD ({e!r})")
+            return None
+        ctx = blok[-VAD_CTX:]
+        out.append(float(p[0][0]))
+    return np.array(out, dtype=np.float32)
+
+def _przebiegi(mask):
+    """Indeksy (start, koniec) ciaglych przebiegow True."""
+    m = np.concatenate([[False], np.asarray(mask, dtype=bool), [False]]).astype(np.int8)
+    d = np.diff(m)
+    return list(zip(np.where(d == 1)[0], np.where(d == -1)[0]))
+
+def kandydaci_z_luk(y, pv):
+    """Kandydaci na odglosy w lukach mowy. y: 16 kHz mono, pv: p(mowa) Silero per 32 ms.
+    Zwraca liste {a, b, dur} w sekundach. Bez modeli - sama geometria (testowalne)."""
+    hop_vad = VAD_WIN / SR
+    dur = len(y) / SR
+    speech = pv >= LUKI_VAD_ON
+    h = int(LUKI_RMS_HOP * SR); n = len(y) // h
+    if n == 0 or len(speech) == 0:
+        return []
+    rms = np.sqrt(np.mean(y[:n * h].reshape(n, h) ** 2, axis=1) + 1e-12)
+    db = 20 * np.log10(rms + 1e-9)
+    vad_at = np.minimum((np.arange(n) * LUKI_RMS_HOP / hop_vad).astype(int), len(speech) - 1)
+    # tlo bez CYFROWEJ CISZY: na materiale z twarda cisza (zera po montazu) percentyl
+    # spadalby do -180 dB i caly szum pomieszczenia stawalby sie "odglosem"
+    tlo_db = db[~speech[vad_at] & (db > LUKI_CISZA_DB)]
+    if len(tlo_db) == 0:
+        return []
+    floor = float(np.percentile(tlo_db, 10))
+    out = []
+    for s, e in _przebiegi(~speech):
+        ga, gb = s * hop_vad, e * hop_vad
+        if gb - ga < LUKI_GAP_MIN:
+            continue
+        lo = ga + (LUKI_EDGE if ga > 0 else 0)
+        hi = gb - (LUKI_EDGE if gb < dur - 0.05 else 0)
+        if hi - lo < LUKI_DMIN:
+            continue
+        i0, i1 = int(lo / LUKI_RMS_HOP), int(hi / LUKI_RMS_HOP)
+        segs = []
+        for rs, re_ in _przebiegi(db[i0:i1] > floor + LUKI_LVL_DB):
+            a, b = lo + rs * LUKI_RMS_HOP, lo + re_ * LUKI_RMS_HOP
+            if segs and a - segs[-1][1] <= LUKI_MERGE:
+                segs[-1][1] = b
+            else:
+                segs.append([a, b])
+        for a, b in segs:
+            if LUKI_DMIN <= b - a <= LUKI_DMAX:
+                out.append({"a": round(a, 3), "b": round(b, 3), "dur": round(b - a, 3)})
+    return out
+
+def _ast_na_kandydatach(y, cands):
+    """AST na kazdym kandydacie z WYCISZONYM otoczeniem (okno >= 1 s wysrodkowane).
+    Dopisuje: p_mowa, p_kat {kategoria: p}, top (najwyzsza klasa). False = brak modelu."""
+    try:
+        fe, model, dev, half, label2idx = _get_ast_model()
+    except Exception as e:
+        log(f"model odgłosów niedostępny ({e!r})")
+        return False
+    id2label = getattr(model.config, "id2label", {}) or {}
+    kat_idx = {k: [label2idx[n.lower()] for n in v if n.lower() in label2idx]
+               for k, v in SOUND_CLASSES.items()}
+    sp_idx = [label2idx[n.lower()] for n in SPEECH_CLASSES if n.lower() in label2idx]
+    def okno(c):
+        a, b = c["a"], c["b"]; d = max(1.0, b - a); m = (a + b) / 2
+        s0 = int(max(0, m - d / 2) * SR); s1 = int(min(len(y) / SR, m + d / 2) * SR)
+        x = y[s0:s1].copy()
+        ia, ib = int(a * SR) - s0, int(b * SR) - s0
+        x[:max(0, ia)] = 0; x[max(0, ib):] = 0
+        return x
+    B = 16
+    for i in range(0, len(cands), B):
+        part = cands[i:i + B]
+        xs = [okno(c) for c in part]
+        try:
+            with torch.no_grad():
+                inp = fe(xs, return_tensors="pt", sampling_rate=SR).to(dev)
+                if half: inp = {k: (v.half() if v.dtype == torch.float32 else v) for k, v in inp.items()}
+                P = torch.sigmoid(model(**inp).logits.float()).cpu().numpy()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            with torch.no_grad():
+                inp = fe(xs, return_tensors="pt", sampling_rate=SR)
+                m_cpu = model.float().cpu()
+                P = torch.sigmoid(m_cpu(**inp).logits.float()).numpy()
+                model.to(dev)
+                if half: model.half()
+        for c, p in zip(part, P):
+            c["p_mowa"] = float(p[sp_idx].max()) if sp_idx else 0.0
+            c["p_kat"] = {k: float(p[ix].max()) for k, ix in kat_idx.items() if ix}
+            c["top"] = str(id2label.get(int(np.argmax(p)), id2label.get(str(int(np.argmax(p))), "")))
+        if (i // B) % 25 == 0:
+            progress(76 + 2 * (i + 1) / max(len(cands), 1), f"Klasyfikacja odgłosów: {i+1}/{len(cands)}")
+    return True
+
+# --- Respiro-en: detektor oddechow (MIT, github.com/ydqmkkx/Respiro-en, Interspeech 2024).
+# Architektura przepisana 1:1 z modules.py autora; Conformer skopiowany z torchaudio 2.7.0
+# (BSD-2-Clause) BEZ importu torchaudio - u nas torchaudio zawiesza `import torch`.
+# Nazwy atrybutow MUSZA zgadzac sie z oryginalem, bo laduje sie jego state_dict.
+RESPIRO_SR = 16000
+RESPIRO_CH = 20.0          # porcja (s): model uczony na krotkich wypowiedziach, a mel
+RESPIRO_OV = 2.0           # jest normalizowany do maksimum porcji; nakladka 2 s
+_RESPIRO = None
+
+def _respiro_net():
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    def _pad_mask(lengths):
+        mx = int(torch.max(lengths).item())
+        return torch.arange(mx, device=lengths.device, dtype=lengths.dtype).expand(
+            lengths.shape[0], mx) >= lengths.unsqueeze(1)
+
+    class _Conv(nn.Module):
+        def __init__(self, d, k, dropout):
+            super().__init__()
+            self.layer_norm = nn.LayerNorm(d)
+            self.sequential = nn.Sequential(
+                nn.Conv1d(d, 2 * d, 1, stride=1, padding=0, bias=True), nn.GLU(dim=1),
+                nn.Conv1d(d, d, k, stride=1, padding=(k - 1) // 2, groups=d, bias=True),
+                nn.BatchNorm1d(d), nn.SiLU(),
+                nn.Conv1d(d, d, kernel_size=1, stride=1, padding=0, bias=True), nn.Dropout(dropout))
+        def forward(self, x):
+            x = self.layer_norm(x).transpose(1, 2)
+            return self.sequential(x).transpose(1, 2)
+
+    class _FF(nn.Module):
+        def __init__(self, d, hd, dropout):
+            super().__init__()
+            self.sequential = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, hd, bias=True), nn.SiLU(),
+                                            nn.Dropout(dropout), nn.Linear(hd, d, bias=True),
+                                            nn.Dropout(dropout))
+        def forward(self, x):
+            return self.sequential(x)
+
+    class _Layer(nn.Module):
+        def __init__(self, d, ffn, heads, k, dropout):
+            super().__init__()
+            self.ffn1 = _FF(d, ffn, dropout)
+            self.self_attn_layer_norm = nn.LayerNorm(d)
+            self.self_attn = nn.MultiheadAttention(d, heads, dropout=dropout)
+            self.self_attn_dropout = nn.Dropout(dropout)
+            self.conv_module = _Conv(d, k, dropout)
+            self.ffn2 = _FF(d, ffn, dropout)
+            self.final_layer_norm = nn.LayerNorm(d)
+        def forward(self, x, mask):
+            x = self.ffn1(x) * 0.5 + x
+            r = x
+            x = self.self_attn_layer_norm(x)
+            x, _ = self.self_attn(query=x, key=x, value=x, key_padding_mask=mask, need_weights=False)
+            x = self.self_attn_dropout(x) + r
+            r = x
+            x = self.conv_module(x.transpose(0, 1)).transpose(0, 1) + r
+            x = self.ffn2(x) * 0.5 + x
+            return self.final_layer_norm(x)
+
+    class Conformer(nn.Module):
+        def __init__(self, input_dim, num_heads, ffn_dim, num_layers, depthwise_conv_kernel_size, dropout=0.0):
+            super().__init__()
+            self.conformer_layers = nn.ModuleList([
+                _Layer(input_dim, ffn_dim, num_heads, depthwise_conv_kernel_size, dropout)
+                for _ in range(num_layers)])
+        def forward(self, x, lengths):
+            mask = _pad_mask(lengths)
+            x = x.transpose(0, 1)
+            for layer in self.conformer_layers:
+                x = layer(x, mask)
+            return x.transpose(0, 1), lengths
+
+    class Down(nn.Module):
+        def __init__(self, i, o):
+            super().__init__()
+            self.conv1 = nn.Sequential(nn.Conv2d(i, o, kernel_size=3, stride=2), nn.ReLU())
+            self.conv2 = nn.Sequential(nn.Conv2d(o, o, kernel_size=3, stride=2), nn.ReLU())
+        def forward(self, x, length):
+            p = 1 - x.shape[-1] % 2
+            x = self.conv1(F.pad(x, (0, p, 0, 0))); length = (length - 3 + p) // 2 + 1
+            p = 1 - x.shape[-1] % 2
+            x = self.conv2(F.pad(x, (0, p, 0, 0))); length = (length - 3 + p) // 2 + 1
+            return x, length
+
+    class Up(nn.Module):
+        def __init__(self, i, o):
+            super().__init__()
+            self.deconv = nn.Sequential(nn.ConvTranspose1d(i, o, kernel_size=3, stride=2), nn.ReLU(),
+                                        nn.ConvTranspose1d(o, o, kernel_size=3, stride=2), nn.ReLU())
+        def forward(self, x):
+            return self.deconv(x)
+
+    class DetectionNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.downsampling = Down(3, 1)
+            self.upsampling = Up(128, 128)
+            self.linear = nn.Linear(31, 128)
+            self.dropout = nn.Dropout(0.1)
+            self.conformer = Conformer(input_dim=128, num_heads=4, ffn_dim=256, num_layers=8,
+                                       depthwise_conv_kernel_size=31, dropout=0.1)
+            self.lstm = nn.LSTM(input_size=128, hidden_size=256, bidirectional=True, batch_first=True)
+            self.fc = nn.Linear(512, 1)
+            self.sigmoid = nn.Sigmoid()
+        def forward(self, x, length):
+            seq = x.shape[-1]
+            x, length = self.downsampling(x, length)
+            x = self.dropout(self.linear(x.squeeze(1).transpose(1, 2).contiguous()))
+            x = self.conformer(x, length)[0]
+            x = self.upsampling(x.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
+            x = self.fc(self.lstm(x)[0])
+            return self.sigmoid(x.squeeze(-1))[:, :seq]
+
+    return DetectionNet()
+
+def _respiro_cechy(wav):
+    """Cechy wejsciowe Respiro jak feature_extractor autora (mel 128 + wariancja + ZCR,
+    okno 25 ms, krok 10 ms). ZCR zwektoryzowane - ta sama suma co petla autora."""
+    sr = RESPIRO_SR; win = int(sr * 0.025); hop = int(sr * 0.01)
+    mel = librosa.feature.melspectrogram(y=wav, sr=sr, n_fft=win, hop_length=hop, n_mels=128)
+    mel = librosa.power_to_db(mel, ref=np.max)
+    w = np.pad(wav, (win // 2, win // 2), "constant")
+    nf = 1 + (w.shape[0] - win) // hop
+    d = np.abs(np.sign(w[1:]) - np.sign(w[:-1]))
+    cs = np.concatenate([[0.0], np.cumsum(d, dtype=np.float64)])
+    st = np.arange(nf) * hop
+    zcr = ((cs[st + win - 1] - cs[st]) * 0.5 / win).astype(np.float32)
+    mel = torch.tensor(mel).unsqueeze(0)
+    zcr = torch.tensor(zcr).unsqueeze(0).unsqueeze(1).expand(-1, 128, -1)
+    vms = torch.var(mel, dim=1).unsqueeze(1).expand(-1, mel.shape[1], -1)
+    return torch.stack((mel, vms, zcr), dim=1), torch.tensor([zcr.shape[-1]])
+
+def _get_respiro():
+    """Model Respiro-en (cache). None gdy brak pliku - wtedy oddechy tylko z AST."""
+    global _RESPIRO
+    if _RESPIRO is not None:
+        return _RESPIRO or None
+    kand = [os.environ.get("RESPIRO_MODEL", "").strip()] + [
+        os.path.join(d, "respiro-en.pt") for d in _model_candidates()]
+    path = next((p for p in kand if p and os.path.exists(p)), None)
+    if path is None:
+        log("model oddechów (Respiro) nie znaleziony - oddechy tylko z modelu AST")
+        _RESPIRO = False
+        return None
+    try:
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        net = _respiro_net()
+        ck = torch.load(path, map_location="cpu", weights_only=True)
+        net.load_state_dict(ck["model"])
+        net.eval().to(dev)
+        _RESPIRO = (net, dev)
+        log(f"model oddechów (Respiro) na {dev}")
+        return _RESPIRO
+    except Exception as e:
+        log(f"model oddechów (Respiro) nie wczytany ({e!r}) - oddechy tylko z modelu AST")
+        _RESPIRO = False
+        return None
+
+def _respiro_probs(y):
+    """p(oddech) per ramka 10 ms dla calego sygnalu 16 kHz. None gdy brak modelu."""
+    r = _get_respiro()
+    if r is None:
+        return None
+    net, dev = r
+    nfr = int(len(y) / RESPIRO_SR * 100) + 1
+    P = np.zeros(nfr, dtype=np.float32)
+    step = int((RESPIRO_CH - RESPIRO_OV) * RESPIRO_SR); win = int(RESPIRO_CH * RESPIRO_SR)
+    nch = max(1, (len(y) + step - 1) // step)
+    for k, s in enumerate(range(0, len(y), step)):
+        ch = y[s:s + win]
+        if len(ch) < RESPIRO_SR:
+            break
+        f, l = _respiro_cechy(ch.astype(np.float32))
+        try:
+            with torch.no_grad():
+                p = net(f.to(dev), l.to(dev))[0].float().cpu().numpy()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache(); net.cpu(); dev = "cpu"
+            with torch.no_grad():
+                p = net(f, l)[0].float().numpy()
+        f0 = int(round(s / RESPIRO_SR * 100))
+        skip = 0 if s == 0 else int(RESPIRO_OV / 2 * 100)
+        seg = p[skip:]
+        n_ok = max(0, min(len(seg), nfr - f0 - skip))
+        P[f0 + skip:f0 + skip + n_ok] = seg[:n_ok]
+        if k % 40 == 0:
+            progress(76 + 2 * (k + 1) / nch, f"Wykrywanie oddechów: {k+1}/{nch}")
+    return P
+
+def klasyfikuj_luke(c):
+    """Decyzja dla kandydata z luki: 'oddech' / 'klik' / None. Kolejnosc warunkow taka jak
+    w pomiarze z odsluchem (20.10.2026) - zmiana kolejnosci zmienia wynik."""
+    if c.get("p_mowa", 0.0) >= LUKI_MOWA_MAX:
+        return None
+    t = c.get("top", "")
+    if t in LUKI_ODRZUC_TOP:
+        return None
+    pk = c.get("p_kat", {})
+    if pk.get("chrzakniecia", 0.0) >= LUKI_CHRZAK_STOP:
+        return None
+    resp = c.get("resp", 0.0)
+    if (resp >= LUKI_ODDECH_RESP and c["dur"] >= LUKI_ODDECH_DMIN) or pk.get("oddechy", 0.0) >= LUKI_ODDECH_AST:
+        return "oddech"
+    if c["dur"] <= LUKI_KLIK_DMAX and t in LUKI_KLIK_TOP and resp < LUKI_ODDECH_RESP:
+        return "klik"
+    return None
+
+def detect_sounds_luki(y, kategorie):
+    """Oddechy i mlasniecia z luk mowy. kategorie: podzbior {'oddechy','mlasniecia'}.
+    Zwraca (ciecia {a,b,dur,typ}, True) albo (None, False) gdy VAD niedostepny -
+    wtedy wolajacy wraca do starej sciezki detect_sounds."""
+    kategorie = [k for k in kategorie if k in ("oddechy", "mlasniecia")]
+    if not kategorie:
+        return [], True
+    progress(76, "Wykrywanie mowy (luki na odgłosy)...")
+    pv = _vad_probs(y)
+    if pv is None:
+        return None, False
+    cands = kandydaci_z_luk(y, pv)
+    log(f"odgłosy w przerwach mowy: {len(cands)} kandydatów")
+    if not cands:
+        return [], True
+    if not _ast_na_kandydatach(y, cands):
+        return [], True
+    resp = _respiro_probs(y) if "oddechy" in kategorie else None
+    for c in cands:
+        if resp is not None:
+            r = resp[int(c["a"] * 100):int(c["b"] * 100) + 1]
+            c["resp"] = float(r.mean()) if len(r) else 0.0
+        else:
+            c["resp"] = 0.0
+    chce = {"oddech": "oddechy" in kategorie, "klik": "mlasniecia" in kategorie}
+    typ = {"oddech": "oddech", "klik": "mlaśnięcie"}
+    out = []; licz = {"oddech": 0, "klik": 0}
+    for c in cands:
+        k = klasyfikuj_luke(c)
+        if k and chce[k]:
+            out.append({"a": c["a"], "b": c["b"], "dur": c["dur"], "typ": typ[k]})
+            licz[k] += 1
+    if chce["oddech"]:
+        log(f"odgłosy [oddech]: {licz['oddech']} fragment(ów)"
+            + ("" if resp is not None else " (bez modelu Respiro)"))
+    if chce["klik"]:
+        log(f"odgłosy [mlaśnięcie]: {licz['klik']} fragment(ów)")
+    return out, True
+
 # ---------- ITERACJA DOMYKAJACA (idempotencja) ----------
 # Detekcja per-okno + prog daja efekt: plik przemielony ponownie lapie kilka nowych,
 # krotkich fillerow/pauz (graniczne przypadki, ktore po zmianie kontekstu przekraczaja
@@ -1546,6 +1942,21 @@ def main():
             if a.tnij_chrzakniecia: kategorie.append("chrzakniecia")
             if a.tnij_oddechy: kategorie.append("oddechy")
             if a.tnij_mlasniecia: kategorie.append("mlasniecia")
+            # ODDECHY i MLASNIECIA: z luk mowy (Silero VAD) na sygnale ORYGINALNYM - tam
+            # luka jest prawdziwa przerwa w mowie, a ciecie nie wychodzi poza nia. Union z
+            # fillerami/pauzami jest bezpieczny (nakladajace sie ciecia scala compute_keeps).
+            # Gdy VAD niedostepny - te kategorie wracaja do starej sciezki detect_sounds.
+            luki_kat = [k for k in kategorie if k in ("oddechy", "mlasniecia")]
+            if luki_kat:
+                snd_luki, ok_luki = detect_sounds_luki(y, luki_kat)
+                if ok_luki:
+                    kategorie = [k for k in kategorie if k not in luki_kat]
+                    if snd_luki:
+                        allc = allc + snd_luki
+                        allc.sort(key=lambda z: z["a"])
+                        log(f"odgłosy z przerw mowy: dodano {len(snd_luki)} fragmentów do wycięcia")
+                else:
+                    log("wykrywanie mowy niedostępne - oddechy i mlaśnięcia starą metodą")
             if kategorie:
                 opisy = {"chrzakniecia": "chrząknięcia/kaszel", "oddechy": "oddechy",
                          "mlasniecia": "mlaśnięcia"}
