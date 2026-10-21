@@ -1192,6 +1192,7 @@ class MainFrame(wx.Frame):
         env["DFN_BIN"] = os.path.join(root, "tools", "deep-filter.exe")  # odszumianie (opcjonalne)
         env["VAD_MODEL"] = os.path.join(root, "model", "silero_vad.onnx")  # guard mowy (Silero)
         env["SPK_MODEL"] = os.path.join(root, "model", "campplus.onnx")  # chronione glosy (CAMPPlus)
+        env["RESPIRO_MODEL"] = os.path.join(root, "model", "respiro-en.pt")  # oddechy (Respiro-en)
         args = [vpy, helper_script("worker.py"), fin, fout,
                 "-p", opts["preset"],
                 "--min-filler", f"{opts['minf']}",

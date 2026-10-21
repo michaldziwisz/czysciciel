@@ -95,6 +95,12 @@ MODEL = "classla/wav2vecbert2-filledPause"
 SPK_URL = ("https://huggingface.co/welcomyou/campplus-3dspeaker-200k-onnx/resolve/"
            "6265ff7af2a104d745b4389026ed9815c6c1c6ff/campplus_cn_en_common_200k.onnx")
 SPK_SHA256 = "dd1740aa1e1ffa3895f96aef2166b8af2bb2ad09c00769dd275ee36aef6a2a7f"
+# Detektor ODDECHOW Respiro-en (MIT, 35 MB, PyTorch, ramki 10 ms; Interspeech 2024).
+# Wykrywanie oddechow w przerwach mowy - zmierzone na 4.4 h audycji i potwierdzone
+# odsluchem. Architektura przepisana w worker.py BEZ torchaudio. Przypiety commit + SHA-256.
+RESPIRO_URL = ("https://raw.githubusercontent.com/ydqmkkx/Respiro-en/"
+               "70e01c60c2f582c41092730680f2894ab24d6467/respiro-en.pt")
+RESPIRO_SHA256 = "1f4a9b96f96645c480bf0e07b1e18cd68878ac0b4bb5dc920ad93f9b17df858a"
 
 # Model wykrywania MUZYKI (AST/AudioSet). Sluzy do CHRONIENIA fragmentow z muzyka:
 # worker nie wycina fillerow/pauz tam, gdzie gra muzyka. ~350 MB (safetensors).
@@ -126,6 +132,8 @@ def _paths():
         "vad": os.path.join(root, "model", "silero_vad.onnx"),  # guard mowy (Silero VAD)
         # wzorce glosow do OCHRONY (czytnik ekranu): CAMPPlus 27 MB, Apache-2.0
         "spk": os.path.join(root, "model", "campplus.onnx"),
+        # detektor oddechow (Respiro-en, MIT, 35 MB) - wycinanie oddechow
+        "respiro": os.path.join(root, "model", "respiro-en.pt"),
         "vpy": os.path.join(root, "runtime", "venv", "Scripts", "python.exe"),
     }
 
@@ -378,6 +386,23 @@ def ensure_spk(P):
     except Exception as e:
         blog(f"instalacja kaldi_native_fbank pominieta ({e!r}) - ochrona glosow nieaktywna")
 
+def ensure_respiro(P):
+    """Dociaga detektor oddechow Respiro-en (35 MB, MIT). Wzorzec jak ensure_spk:
+    NIEZALEZNY od RUNTIME_VER, idempotentny, suma kontrolna, blad = cicha rezygnacja
+    (worker wykrywa wtedy oddechy samym modelem AST, slabiej)."""
+    if os.path.exists(P["respiro"]):
+        return
+    boot(92, "Pobieranie modelu wykrywania oddechów (~35 MB)...")
+    try:
+        _download(RESPIRO_URL, P["respiro"], "model wykrywania oddechów (Respiro-en)", 92, 1,
+                  sha256=RESPIRO_SHA256)
+    except Exception as e:
+        blog(f"pobieranie modelu oddechów pominięte ({e!r}) - oddechy tylko z modelu AST")
+        try:
+            if os.path.exists(P["respiro"]): os.remove(P["respiro"])
+        except Exception:
+            pass
+
 def ensure_music_model(P, env):
     """Dociaga model wykrywania MUZYKI (AST) do PLASKIEGO katalogu music_model, jesli
     go jeszcze nie ma. NIEZALEZNE od RUNTIME_VER - istniejaca instalacja (torch+venv
@@ -446,6 +471,7 @@ def ensure(force_device=None):
                 ensure_denoiser(P)          # j.w. dla modulu odszumiania
                 ensure_vad(P)               # j.w. dla modelu VAD (guard mowy)
                 ensure_spk(P)               # j.w. dla modelu glosow (chronione glosy)
+                ensure_respiro(P)           # j.w. dla detektora oddechow
                 cleanup_training_files(P)   # odzyskaj miejsce po plikach treningowych
                 maybe_update_model(P, env)
                 boot(100, "Srodowisko gotowe")
@@ -549,6 +575,8 @@ def ensure(force_device=None):
     ensure_vad(P)
     # 6e. model glosow (CAMPPlus, ~27 MB) - funkcja CHRONIONE GLOSY (wzorce od usera)
     ensure_spk(P)
+    # 6f. detektor oddechow (Respiro-en, ~35 MB) - wycinanie oddechow
+    ensure_respiro(P)
     cleanup_training_files(P)   # gdyby repo modelu jednak podrzucilo pliki treningowe
     boot(98, "Modele pobrane")
 
